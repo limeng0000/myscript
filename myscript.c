@@ -1,2566 +1,4907 @@
+#include "assert.h"
+#include "ctype.h"
 #include "stdio.h"
 #include "stdlib.h"
 #include "string.h"
-#include "ctype.h"
-#include "assert.h"
-#define HASH_MAX 109
-#define FRAME_DEPTH 256
-#define VECTOR_MAX 12
-#define NUM_RESERVED 19
-#define NUM_INSIDE 12
+#include "time.h"
 
-#define next_char(lex)  lex->curr_char = lex->content[++lex->pos]
-#define look_char(lex)  lex->content[lex->pos + 1]
+/*#define DEBUG*/
+#define MAX_STACK 36864 /*1024*36*/
+#define GLOBAL_VARS 512
+#define INIT_GC_CAP 1024
+#define INIT_INCODE 64
+#define INIT_VAR 32
+#define INIT_CONST 32
+#define INIT_PARSER_TAB 128
+#define RESERVE_MAP_CAP 12
+#define OP_VALUE (inData[++ip])
 
-#define vector_struct(T,vector)  \
-typedef struct  {                \
-	T *data;                     \
-	int n;                       \
-	int capacity;                \
-} vector
+#define vec_struct(T, vector) \
+    typedef struct            \
+    {                         \
+        T *data;              \
+        int n;                \
+        int cap;              \
+    } vector
 
-#define vector_push(this, T, value)                                  \
-do{                                                                  \
-    if ((this)->n + 1 > (this)->capacity) {                          \
-	int capacity = ((this)->capacity+1)* 2;                          \
-	(this)->data = (T *) realloc((this)->data, capacity * sizeof(T));\
-	if ((this)->data == NULL) {                                      \
-		printf("memory expansion failed");                           \
-		exit(1);                                                     \
-	}                                                                \
-	(this)->capacity = capacity;                                     \
-    }                                                                \
-    ((this)->data)[(this)->n] = value;                               \
-    (this)->n++;                                                     \
-} while (0)
+#define expand_vector(this, T)                                               \
+    do                                                                       \
+    {                                                                        \
+        if ((this)->n + 1 > (this)->cap)                                     \
+        {                                                                    \
+            int capacity = ((this)->cap + 1) * 2;                            \
+            (this)->data = (T *)realloc((this)->data, capacity * sizeof(T)); \
+            if ((this)->data == NULL)                                        \
+            {                                                                \
+                printf("memory error");                                      \
+                exit(1);                                                     \
+            }                                                                \
+            (this)->cap = capacity;                                          \
+        }                                                                    \
+    } while (0)
 
-#define vector_pop(this)    \
-({                          \
-	assert((this)->n > 0);  \
-	(this)->n--;            \
-	(this)->data[(this)->n];\
-})
+#define init_vector(this, T, size)                         \
+    do                                                     \
+    {                                                      \
+        (this)->n = 0;                                     \
+        (this)->cap = size;                                \
+        (this)->data = (T *)malloc(this->cap * sizeof(T)); \
+    } while (0)
 
-#define vector_init(this, T, size)                            \
-do{                                                           \
-	(this)->n = 0;                                            \
-	(this)->capacity = size;                                  \
-	(this)->data = (T *) malloc((this)->capacity * sizeof(T));\
-}while (0)
+#define OBJECT_HEAD  \
+    ObjectKind type; \
+    int mark;        \
+    struct MyObject_ *next;
 
-#define vector_last(this)           \
-    ({                              \
-        assert(!((this)->n == 0));  \
-        (this)->data[(this)->n - 1];\
-    })
+#define init_object_head(obj) \
+    obj->mark = 0;            \
+    obj->next = vm.gc.head;   \
+    vm.gc.head = (MyObject *)obj
 
-#define save_char(this,v) vector_push(&this->buff,char,v)
-#define save_value(this,v) vector_push(&this->value,Value,v)
-#define save_runtime_stack(this,v) vector_push(&this->runtime,Value,v)
-#define save_field(this,v) vector_push(&this->fields,Field,v)
-#define vector_new(this, T) vector_init(this, T, VECTOR_MAX)
-#define is_func_obj(v)  v.type == OBJECT && v.u.object->in_class == &G_function_class
-#define is_map_string(a,b)  \
-a.type == OBJECT && a.u.object->in_class == &G_map_class && b.type == OBJECT && b.u.object->in_class == &G_string_class
-#define is_list_integer(a,b)  a.type == OBJECT && a.u.object->in_class == &G_list_class && b.type == INTEGER
+#define next_char() lex.currChar = lex.content[++lex.pos]
+#define look_char() lex.content[lex.pos + 1]
+#define obj_to_val(obj) ((Value){OBJECT, {.object = (MyObject *)obj}})
+#define num_to_val(n) ((Value){NUMBER, {.number = n}})
+#define tag_label(label) int label = parser.curr->inCode.n
+#define set_label(label) parser.curr->inCode.data[label] = parser.curr->inCode.n
 
-#define OBJECT_HEAD                 \
-	struct ClassObject_ * in_class ;\
-	int mark;                       \
-	struct MyObject_ * next;
-
-#define PARSER_HEAD           \
-	OBJECT_HEAD               \
-	struct ModuleObject_ *top;\
-	VectorInstr in_code;      \
-	VectorValue value;        \
-	VectorInt var;            \
-	StringPos name;
-
-typedef int StringPos;
-typedef int Var;
-
-const char *reserve[] = { "var", "function", "if", "else", "true", "false", "while", "for", "break", "return", "null",
-		"class", "this", "of", "extends", "super", "new", "import", "continue" };
-
-typedef enum ValueKind_ {
-	INTEGER, NUMBER, OBJECT, TRUE, FALSE, NONE, UNDEFINED
+typedef enum ValueKind_
+{
+    NUMBER,
+    OBJECT,
+    TRUE,
+    FALSE,
+    NONE,
+    SUPER
 } ValueKind;
-
-typedef enum TokenKind_ {
-	TOKEN_VAR = 257,/*global*/
-	TOKEN_FUNCTION,/*function*/
-	TOKEN_IF,/*if*/
-	TOKEN_ELSE,/*else*/
-	TOKEN_TRUE,/*true*/
-	TOKEN_FALSE,/*false*/
-	TOKEN_WHILE,/*while*/
-	TOKEN_FOR,/*for*/
-	TOKEN_BREAK,/*break*/
-	TOKEN_RETURN,/*return*/
-	TOKEN_NULL,/*NULL*/
-	TOKEN_CLASS,/*class*/
-	TOKEN_THIS,/*this*/
-	TOKEN_OF,/*of*/
-	TOKEN_EXTENDS,/*extends*/
-	TOKEN_SUPER,/*super*/
-	TOKEN_NEW,/*new*/
-	IMPORT_TOKEN,/*import*/
-	TOKEN_CONTINUE,/*continue*/
-	TOKEN_NUMBER,/*16.23*/
-	TOKEN_INTEGER,/*16.23*/
-	TOKEN_STRING,/*"helloworld"*/
-	STRING_FOEMAT_TOKEN,/*"hello%sworld"*/
-	TOKEN_OR,/*||*/
-	TOKEN_AND,/*&&*/
-	TOKEN_LT_EQ,/*<=*/
-	TOKEN_GT_EQ,/*>=*/
-	TOKEN_EQ,/*==*/
-	TOKEN_NOT_EQ,/*!=*/
-	TOKEN_NEWLINE,/*\n*/
-	TOKEN_IDENTIFIER,/*var*/
-	TOKEN_EOF/*end*/
+typedef enum ObjectKind_
+{
+    STRING_OBJ,
+    LIST_OBJ,
+    MAP_OBJ,
+    INSTANCE_OBJ,
+    COMPILER_OBJ,
+    CLASS_OBJ,
+    MEMBER_OBJ,
+    BUILDIN_OBJ
+} ObjectKind;
+typedef enum TokenKind_
+{
+    TOKEN_VAR = 257,  /*global*/
+    TOKEN_FUNCTION,   /*function*/
+    TOKEN_IF,         /*if*/
+    TOKEN_ELSE,       /*else*/
+    TOKEN_TRUE,       /*true*/
+    TOKEN_FALSE,      /*false*/
+    TOKEN_WHILE,      /*while*/
+    TOKEN_FOR,        /*for*/
+    TOKEN_BREAK,      /*break*/
+    TOKEN_RETURN,     /*return*/
+    TOKEN_NULL,       /*NULL*/
+    TOKEN_CLASS,      /*class*/
+    TOKEN_THIS,       /*this*/
+    TOKEN_OF,         /*of*/
+    TOKEN_EXTENDS,    /*extends*/
+    TOKEN_SUPER,      /*super*/
+    TOKEN_NEW,        /*new*/
+    TOKEN_IMPORT,     /*import,暂未实现*/
+    TOKEN_NUMBER,     /*数字，例如：16.23*/
+    TOKEN_STRING,     /*字符串，例如："helloworld"*/
+    TOKEN_OR,         /*||*/
+    TOKEN_AND,        /*&&*/
+    TOKEN_LT_EQ,      /*<=*/
+    TOKEN_GT_EQ,      /*>=*/
+    TOKEN_EQ,         /*==*/
+    TOKEN_NOT_EQ,     /*!=*/
+    TOKEN_IDENTIFIER, /*变量，例如：i*/
+    TOKEN_EOF         /*end*/
 } TokenKind;
-
-typedef enum OpKind_ {
-	OP_LOAD_GLOBAL,
-	OP_BUILD_OBJECT,
-	OP_BUILD_LIST,
-	OP_BUILD_CLASS,
-	OP_BUILD_MAP,
-	OP_FUNC_CALL,
-	OP_ARRAY_LENGTH,
-	OP_STORE_ATTR,
-	OP_LOAD_ATTR,
-	OP_RETURN,
-	OP_LOAD,
-	OP_INDEX,
-	OP_THIS,
-	OP_SUPER,
-	OP_CONST_INT,
-	OP_CONST_NULL,
-	OP_CONST_FALSE,
-	OP_CONST_TRUE,
-	OP_PUSH,
-	OP_STORE,
-	OP_STORE_INDEX,
-	OP_GOTO,
-	OP_GOTO_IF_FALSE,
-	OP_NOT,
-	OP_MINUS,
-	OP_NEW,
-	OP_PLUS,
-	OP_PLUS_SELF,
-	OP_SUB,
-	OP_MUL,
-	OP_DIV,
-	OP_EQ,
-	OP_NOT_EQ,
-	OP_OR,
-	OP_AND,
-	OP_LT_EQ,
-	OP_GT_EQ,
-	OP_NE,
-	OP_GT,
-	OP_GE,
-	OP_LT,
-	OP_LE,
-	OP_END
+typedef enum OpKind_
+{
+    OP_LOAD_GLOBAL = 0, /*加载全局变量到运行时栈，操作值：字符串在常量数组的位置，执行后：运行时栈+1*/
+    OP_BUILD_LIST,      /*创建一个list对象并加载到运行时栈，操作值：list对象的元素数量n，执行后：运行时栈-n+1*/
+    OP_BUILD_MAP,       /*创建一个map对象并加载到运行时栈，操作值：map对象的元素数量n*2，执行后：运行时栈-n*2+1*/
+    OP_ARRAY_LENGTH,    /*弹出栈顶的list对象获得list长度并加载到运行时栈，操作值：无操作值，执行后:运行时栈+1*/
+    OP_LOAD,            /*加载变量到运行时栈，操作值：函数中变量的位置，执行后：运行时栈+1*/
+    OP_PUSH,            /*加载常量到运行时栈，操作值：常量所在的位置，执行后：运行时栈+1*/
+    OP_SUPER,           /*加载实例对象的父类到运行时栈，操作值：无，执行后：运行时栈+1*/
+    OP_THIS,            /*加载实例对象到运行时栈，操作值：无，执行后：运行时栈+1*/
+    OP_CONST_INT,       /*加载int数值运行时栈，操作值：数值，执行后：运行时栈+1*/
+    OP_CONST_NULL,      /*加载空值到运行时栈，操作值：无，执行后：运行时栈+1*/
+    OP_CONST_FALSE,     /*加载假值到运行时栈，操作值：无，执行后：运行时栈+1*/
+    OP_CONST_TRUE,      /*加载真值到运行时栈，操作值：无，执行后：运行时栈+1*/
+    OP_STORE_GLOBAL,    /*弹出运行时栈顶数据储存到全局变量，操作值：字符串在常量数组的位置，执行后:运行时栈-1*/
+    OP_BUILD_CLASS,     /*创建一个Class对象并储存到全局变量，操作值：字符串在常量数组的位置，执行后：运行时栈-n-1*/
+    OP_BUILD_OBJECT,    /*根据栈顶的class对象创建实例对象并加载到运行时栈，操作值：初始化方法需要的参数n，执行后：运行时栈-n*/
+    OP_FUNC_CALL,       /*根据栈顶的MyCompiler对象调用函数，操作值：函数需要的参数n，执行后：运行时栈-n*/
+    OP_METHOD_CALL,     /*根据栈顶-1位置的实例对象等对象调用对象的方法，操作值：方法需要的参数n，执行后：运行时栈-n-1*/
+    OP_STORE_ATTR,      /*根据栈顶-1位置的实例对象或者map对象，把栈顶的值写入，操作值：字符串在常量数组的位置，执行后：运行时栈-2*/
+    OP_LOAD_ATTR,       /*根据栈顶的实例对象等及字符串key获得value值并写入栈顶，操作值：字符串在常量数组的位置，执行后：不变*/
+    OP_RETURN,          /*把栈顶的值写入函数调起时的栈顶的位置，操作值：无，执行后：函数调起时栈顶的位置*/
+    OP_INDEX,           /*根据栈顶的索引及栈顶-1位置的list对象或者map对象获取值写入运行时栈,操作值：无，执行后：-1*/
+    OP_STORE,           /*弹出栈顶的值写入变量，操作值：函数中变量的位置，执行后：运行时栈-1*/
+    OP_STORE_INDEX,     /*根据栈顶的值及栈顶-1位置索引及栈顶-2位置的list对象或者map对象，写入数据,操作值：无，执行后：-3*/
+    OP_GOTO,            /*ip跳转到操作值的位置，操作值：代码执行位置，执行后：不变*/
+    OP_GOTO_IF_FALSE,   /*根据栈顶的值判断是否是假，如果假跳转到操作值，操作值：代码执行位置，执行后：-1*/
+    OP_PLUS_SELF,       /*对变量进行自加操作，操作值：函数中变量的位置，执行后：不变*/
+    OP_NOT,             /*弹出栈顶的值并对值取非操作，并写入栈顶，操作值：无，执行后：不变*/
+    OP_MINUS,           /*弹出栈顶的值并对值取负操作，并写入栈顶，操作值：无，执行后：不变*/
+    OP_PLUS,            /*弹出栈顶的值及栈顶-1的值，相加后写入栈顶，操作值：无，执行后：-1*/
+    OP_SUB,             /*弹出栈顶的值及栈顶-1的值，相减后写入栈顶，操作值：无，执行后：-1*/
+    OP_MUL,             /*弹出栈顶的值及栈顶-1的值，相乘后写入栈顶，操作值：无，执行后：-1*/
+    OP_DIV,             /*弹出栈顶的值及栈顶-1的值，相除后写入栈顶，操作值：无，执行后：-1*/
+    OP_EQ,              /*弹出栈顶的值及栈顶-1的值，判断是否相等写入栈顶，操作值：无，执行后：-1*/
+    OP_NOT_EQ,          /*弹出栈顶的值及栈顶-1的值，判断是否不相等写入栈顶，操作值：无，执行后：-1*/
+    OP_OR,              /*弹出栈顶的值及栈顶-1的值，取或操作写入栈顶，操作值：无，执行后：-1*/
+    OP_AND,             /*弹出栈顶的值及栈顶-1的值，取与操作写入栈顶，操作值：无，执行后：-1*/
+    OP_LT_EQ,           /*弹出栈顶的值及栈顶-1的值，判断是否小于等于写入栈顶，操作值：无，执行后：-1*/
+    OP_GT_EQ,           /*弹出栈顶的值及栈顶-1的值，判断是否大于等于写入栈顶，操作值：无，执行后：-1*/
+    OP_LT,              /*弹出栈顶的值及栈顶-1的值，判断是否小于写入栈顶，操作值：无，执行后：-1*/
+    OP_GT               /*弹出栈顶的值及栈顶-1的值，判断是否大于写入栈顶，操作值：无，执行后：-1*/
 } OpKind;
-
-struct Instruction_;
-struct StringObject_;
-struct ClassObject_;
-struct InstanceObject_;
-struct MyParserObject_;
-struct Interpreter_;
-struct GlobalInfo_;
-struct Frame_;
-struct ModuleObject_;
-struct FunctionObject_;
-struct ClassCodeObject_;
-struct Lexer_;
-struct Value_;
-struct Field_;
-
-vector_struct(int, VectorInt);
-vector_struct(char, VectorChar);
-vector_struct(struct Instruction_, VectorInstr);
-vector_struct(struct StringObject_ *, VectorString);
-vector_struct(struct Value_, VectorValue);
-vector_struct(struct Field_, VectorField);
-
-typedef struct MyObject_ {
-	OBJECT_HEAD
+/*
+ * struct MyObject - 对象的结构体，所有对象可以通过强转成MyObject类型获得共有的OBJECT_HEAD这部分数据
+ * @OBJECT_HEAD:所有对象共有部分数据
+ */
+typedef struct MyObject_
+{
+    OBJECT_HEAD
 } MyObject;
-
-typedef struct Value_ {
-	ValueKind type;
-	union {
-		double number;
-		int integer;
-		MyObject *object;
-	} u;
+/*
+ * struct Value - 值的结构体，所有值类型可以通过type识别
+ * @type:区分值的类型
+ * @u.number:数字值
+ * @u.object:对象值
+ */
+typedef struct Value_
+{
+    ValueKind type;
+    union
+    {
+        double number;
+        MyObject *object;
+    } u;
 } Value;
-
-typedef struct Frame_ {
-	Value *value;
-	int n;
-	VectorValue runtime;
-} Frame;
-
-typedef struct Field_ {
-	Var var;
-	Value value;
-} Field;
-
-typedef struct GlobalInfo_ {
-	struct Lexer_ *lexer;
-	struct MyParserObject_ *top_parser;
-	Frame frames[FRAME_DEPTH];
-	int top_frame;
-	MyObject *gc_head;
-	int gc_capacity;
-	int gc_count;
-} GlobalInfo;
-
-typedef struct StringObject_ {
-	OBJECT_HEAD
-	char *str_char;
-	int len;
-	int is_const;
+/*
+ * struct StringObject - 字符串对象
+ * @OBJECT_HEAD:对象的头信息
+ * @str:字符串
+ * @len:字符串长度
+ * @hash:字符串的哈希值
+ */
+typedef struct StringObject_
+{
+    OBJECT_HEAD
+    char *str;
+    int len;
+    unsigned int hash;
 } StringObject;
 
-typedef struct ClassObject_ {
-	OBJECT_HEAD
-	VectorField fields;
-	StringPos name;
-	void (*mark_obj)(MyObject*);
-	void (*free_obj)(MyObject*);
-	struct ClassCodeObject_ *code;
-	struct ClassObject_ *super;
-} ClassObject;
+vec_struct(void *, VecVoid);
+vec_struct(Value, VecValue);
+vec_struct(int, VecInt);
+/*
+ * pushIntVec(VecInt *this, int v) - 对int数组插入数据
+ * @this:int数组
+ * @v:值
+ *
+ * 判断数组的数量是否超过其容量，如果是则使容量扩展乘其容量+1后乘2，
+ * 容量扩展时+1是为了防止原来容量是0的情况，最后在数组末尾插入数据
+ *
+ * Return:void
+ */
+void pushIntVec(VecInt *this, int v)
+{
+    expand_vector(this, int);
+    (this->data)[this->n++] = v;
+}
+void pushValueVec(VecValue *this, Value v)
+{
+    expand_vector(this, Value);
+    (this->data)[this->n++] = v;
+}
+void pushVoidVec(VecVoid *this, void *s)
+{
+    expand_vector(this, void *);
+    (this->data)[this->n++] = s;
+}
+/*
+ * popIntVec(VecInt *this) - 对int数组弹出数据
+ * @this:int数组
+ *
+ * 判断数组的数量是否大于0，如果小于等于0报错，并返回数组最后的元素
+ *
+ * Return:int
+ */
+int popIntVec(VecInt *this)
+{
+    assert(this->n > 0);
+    this->n--;
+    return this->data[this->n];
+}
+Value popValueVec(VecValue *this)
+{
+    assert(this->n > 0);
+    this->n--;
+    return this->data[this->n];
+}
+void *popVoidVec(VecVoid *this)
+{
+    assert(this->n > 0);
+    this->n--;
+    return this->data[this->n];
+}
+/*
+ * initIntVec(VecInt *this, int size) - 对int数组进行初始化
+ * @this:int数组
+ * @size:数组容量大小
+ *
+ * 根据数组容量大小对数组进行初始化
+ *
+ * Return:void
+ */
+void initIntVec(VecInt *this, int size)
+{
+    init_vector(this, int, size);
+}
+void initValueVec(VecValue *this, int size)
+{
+    init_vector(this, Value, size);
+}
+void initVoidVec(VecVoid *this, int size)
+{
+    init_vector(this, void *, size);
+}
+/*
+ * util_key2hash() - 根据字符串生成哈希值
+ * @key:输入的字符串
+ * @len:字符串长度
+ *
+ * 函数用来计算字符串的哈希值，用来最大化分散数组的字符串，避免字符串的碰撞，算法是：FNV-1a
+ *
+ * Return:哈希值
+ */
+unsigned int utilKey2Hash(char *key, int len)
+{
+    unsigned int hash = 2166136261u;
+    int i;
+    for (i = 0; i < len; i++)
+    {
+        hash ^= key[i];
+        hash *= 16777619;
+    }
+    return hash;
+}
+/*
+ * utilStrdup(const char *s) - 根据字符串拷贝函数
+ * @s:输入的字符串
+ *
+ * 用于将c语言中引号括起来的字符串，拷贝到内存中方便内存管理
+ *
+ * Return:字符串
+ */
+char *utilStrdup(const char *s)
+{
+    int size = strlen(s) + 1;
+    char *p = malloc(size);
+    if (p)
+    {
+        memcpy(p, s, size);
+    }
+    return p;
+}
 
-typedef struct ListObject_ {
-	OBJECT_HEAD
-	VectorValue list;
-} ListObject;
-
-typedef struct HashNode_ {
-	StringObject *string;
-	int hash_value;
-	Value v;
-	struct HashNode_ *next;
-} HashNode;
-
-typedef struct MapObject_ {
-	OBJECT_HEAD
-	int capacity;
-	HashNode **hash_table;
-} MapObject;
-
-typedef struct Lexer_ {
-	int type;
-	int curr_line;
-	VectorChar buff;
-	char *content;
-	int pos;
-	char curr_char;
-	union {
-		int integer;
-		double number;
-		StringPos str_pos;
-	} u;
+/*************************
+ * 以下词法分析器部分
+ *************************
+ */
+/*
+ * struct Token - 标识符结构体，经过词法分析后用来识别字符表示的含义
+ * @type:类型，对应枚举TokenKind及acsii小于257的单字符
+ * @line：所在的行，方便后续虚拟机打印报错信息
+ * @start：token在程序文本中的开始位置
+ * @u.number:数字值
+ * @u.str:字符串值
+ */
+typedef struct Token_
+{
+    int type;
+    int line;
+    int start;
+    union
+    {
+        double number;
+        StringObject *str;
+    } u;
+} Token;
+/*
+ * struct StringMap - 用来存放词法分析阶段的哈希map-拉链法
+ * @cap：哈希map的容量
+ * @tabStr：数量为cap的哈希map
+ */
+typedef struct StringMap_
+{
+    int cap;
+    StringObject **tabStr;
+} StringMap;
+/*
+ * struct Lexer - 词法分析器结构体
+ * @token：当前标识符
+ * @content：程序文本字符串
+ * @size：程序文本大小
+ * @pos：当前字符在程序文本的位置
+ * @currChar：当前字符
+ * @strMap：字符串的哈希map
+ * @keysWords：myscript语言的关键字
+ */
+typedef struct Lexer_
+{
+    Token token;
+    char *content;
+    int size;
+    int pos;
+    char currChar;
+    StringMap strMap;
+    unsigned int keysWords[18];
 } Lexer;
 
-typedef struct ExprTempType_ {
-	int flag;
-	StringPos str_pos;
-} ExprTempType;
+Lexer lex; /*全局词法分析器*/
 
-typedef struct Instruction_ {
-	OpKind op;
-	int v;
-} Instruction;
+/*
+ * syntaxError(char *msg) - 打印语法分析错误并退出
+ * @msg:需要输出的错误字符
+ * Return:void
+ */
+void syntaxError(char *msg)
+{
+    printf("syntaxError:line [%d:%d] >>>>>> %s", lex.token.line, lex.token.start, msg);
+    exit(1);
+}
+/*
+ * initStringMap(StringMap *obj, int size) - 初始化词法分析阶段哈希map
+ * @obj:哈希map
+ * @size:哈希map容量
+ * Return:void
+ */
+void initStringMap(StringMap *obj, int size)
+{
+    obj->cap = size;
+    obj->tabStr = (StringObject **)malloc(sizeof(StringObject *) * size);
+    int i;
+    for (i = 0; i < size; i++)
+    {
+        obj->tabStr[i] = NULL;
+    }
+}
+/*
+ * readFile(const char *file) - 读取程序文本文件
+ * @file:程序文本文件名
+ *
+ * 读取文件内容到内存中并将内容返回
+ *
+ * Return:程序文本字符串
+ */
+char *readFile(const char *file)
+{
+    FILE *fp = fopen(file, "r");
+    if (fp == NULL)
+    {
+        printf("file %s open failed", file);
+        exit(1);
+    }
+    fseek(fp, 0, SEEK_END);
+    int size = ftell(fp);
+    if (size == 0)
+    {
+        printf("file %s is empty", file);
+        exit(1);
+    };
+    rewind(fp);
+    char *content = (char *)malloc(size + 1);
+    memset(content, 0, size + 1);
+    fread(content, sizeof(char), size, fp);
+    fclose(fp);
+    return content;
+}
+StringObject *tokenSaveStr(char *from, int len, unsigned int hash);
+/*
+ * StringObject *initLexer(const char *file) - 初始化词法分析器
+ * @file:程序文本文件名
+ *
+ * 通过全局变量lex初始化词法分析器的各个成员变量，并把程序文件名包装成StringObject类型返回
+ * 这里strMap容量的大小等于程序文本大小除5加10作为初始容量，且不会改变
+ *
+ * Return:StringObject类型的程序文本文件名
+ */
+StringObject *initLexer(const char *file)
+{
+    char *content = readFile(file);
+    lex.token.type = TOKEN_EOF;
+    lex.token.line = 0;
+    lex.token.start = 0;
+    lex.content = content;
+    lex.size = strlen(content);
+    lex.pos = 0;
+    lex.currChar = lex.content[lex.pos];
+    initStringMap(&lex.strMap, (int)(lex.size / 5) + 10);
+    lex.keysWords[0] = utilKey2Hash("var", 3);
+    lex.keysWords[1] = utilKey2Hash("function", 8);
+    lex.keysWords[2] = utilKey2Hash("if", 2);
+    lex.keysWords[3] = utilKey2Hash("else", 4);
+    lex.keysWords[4] = utilKey2Hash("true", 4);
+    lex.keysWords[5] = utilKey2Hash("false", 5);
+    lex.keysWords[6] = utilKey2Hash("while", 5);
+    lex.keysWords[7] = utilKey2Hash("for", 3);
+    lex.keysWords[8] = utilKey2Hash("break", 5);
+    lex.keysWords[9] = utilKey2Hash("return", 6);
+    lex.keysWords[10] = utilKey2Hash("null", 4);
+    lex.keysWords[11] = utilKey2Hash("class", 5);
+    lex.keysWords[12] = utilKey2Hash("this", 4);
+    lex.keysWords[13] = utilKey2Hash("of", 2);
+    lex.keysWords[14] = utilKey2Hash("extends", 7);
+    lex.keysWords[15] = utilKey2Hash("super", 5);
+    lex.keysWords[16] = utilKey2Hash("new", 3);
+    lex.keysWords[17] = utilKey2Hash("import", 6);
+    char *filename = utilStrdup(file);
+    int len = strlen(filename);
+    return tokenSaveStr(filename, len, utilKey2Hash(filename, len));
+}
+/*
+ * eatToken(int token_enum) - 保存当前token类型，当前字符指向下一个
+ * @token_enum:token类型
+ *
+ * 用于单字符的识别比如赋值操作'=',把该的acsii的值作为token_enum保存到lex中,当前字符指向下一个
+ *
+ * Return:void
+ */
+void eatToken(int token_enum)
+{
+    lex.token.type = token_enum;
+    next_char();
+}
+/*
+ * eat2Token(int token_enum) - 保存当前token类型，当前字符指向下下一个
+ * @token_enum:token类型
+ *
+ * 用于两个字符的识别比如判断是否相等'==',把字符对应的枚举类型TokenKind转成int类型保存到lex中,当前字符指向下下一个
+ *
+ * Return:void
+ */
+void eat2Token(int token_enum)
+{
+    lex.token.type = token_enum;
+    lex.pos++;
+    next_char();
+}
+/*
+ * initStringNoGc(char *str) - 初始化不会被GC回收的字符串对象
+ * @str:字符串
+ *
+ * 给StringObject对象分配内存，初始化各个成员变量
+ * 用这个函数创建的StringObject对象next指向NULL且没有加入GC，不会被GC回收
+ *
+ * Return:StringObject类型的字符串
+ */
+StringObject *initStringNoGc(char *str)
+{
+    StringObject *obj = (StringObject *)malloc(sizeof(StringObject));
+    obj->type = STRING_OBJ;
+    obj->len = strlen(str);
+    obj->hash = utilKey2Hash(str, obj->len);
+    obj->str = str;
+    obj->next = NULL;
+    obj->mark = 0;
+    return obj;
+}
+/*
+ * tokenSaveStr(char *from, int len, unsigned int hash) - 保存字符串词法分析阶段的哈希map中
+ * @from:字符串
+ * @len:字符串长度
+ * @hash:字符串哈希值
+ *
+ * 对输入的字符串判断时候已经在词法分析阶段的哈希map中，如果存在直接返回哈希map中的StringObject对象
+ * 如果不存在分配内存并复制from中的字符到内存中，并使用initStringNoGc方法创建StringObject对象，
+ * 并把该对象加入到词法分析阶段的哈希map中
+ *
+ * Return:StringObject类型的字符串
+ */
+StringObject *tokenSaveStr(char *from, int len, unsigned int hash)
+{
+    int pos = hash % lex.strMap.cap;
+    StringObject *tmp;
+    for (tmp = lex.strMap.tabStr[pos]; tmp != NULL; tmp = (StringObject *)tmp->next)
+    {
+        if (tmp->hash == hash)
+        {
+            return tmp;
+        }
+    }
+    char *toStr = (char *)malloc(len + 1);
+    memcpy(toStr, from, len);
+    toStr[len] = '\0';
+    StringObject *str = initStringNoGc(toStr);
+    str->mark = 0;
+    str->next = (MyObject *)lex.strMap.tabStr[pos];
+    lex.strMap.tabStr[pos] = str;
+    return str;
+}
+/*
+ * tokenString() - 保存字符串到token中
+ *
+ * 循环判断当前字符是否是'"'，如果不是继续循环，如果是说明已经把字符串识别出来
+ * 把识别出来的字符串保存到token中
+ *
+ * Return:void
+ */
+void tokenString()
+{
+    next_char();
+    while (lex.currChar != '"')
+    {
+        next_char();
+    }
+    next_char();
+    char *from = lex.content + lex.token.start + 1;
+    int len = lex.pos - lex.token.start - 2;
+    int hash = utilKey2Hash(from, len);
+    lex.token.u.str = tokenSaveStr(from, len, hash);
+    lex.token.type = TOKEN_STRING;
+}
+/*
+ * tokenNumber() - 保存数字到token中
+ *
+ * 循环判断当前字符是否是数字，如果不是退出循环，然后判断数字是否带有小数点
+ * 把识别出来的数字保存到token中
+ *
+ * Return:void
+ */
+void tokenNumber()
+{
+    while (isdigit(lex.currChar))
+    {
+        next_char();
+    }
+    if (lex.currChar == '.')
+    {
+        next_char();
+        if (!isdigit(lex.currChar))
+        {
+            syntaxError("number token error");
+        }
+        while (isdigit(lex.currChar))
+        {
+            next_char();
+        }
+    }
+    double num = strtod(lex.content + lex.token.start, NULL);
+    lex.token.u.number = num;
+    lex.token.type = TOKEN_NUMBER;
+}
+/*
+ * tokenIdentifier() - 保存关键字或变量到token中
+ *
+ * 循环判断当前字符是否是字符或者_，如果不是退出循环，退出循环时的位置减开始的位置就是字符的全部内容，
+ * 计算字符的hash值与关键字的hash值对比，对比成功说明是关键字把token类型设置成对应的TokenKind并返回，
+ * 如果没有对比成功说明是变量，把变量的字符串保存到token，并把token类型设置成TOKEN_IDENTIFIER
+ *
+ * Return:void
+ */
+void tokenIdentifier()
+{
+    if (isalpha(lex.currChar) || lex.currChar == '_')
+    {
+        next_char();
+    }
+    while (isalpha(lex.currChar) || lex.currChar == '_' || isdigit(lex.currChar))
+    {
+        next_char();
+    }
+    char *from = lex.content + lex.token.start;
+    int len = lex.pos - lex.token.start;
+    unsigned int hash = utilKey2Hash(from, len);
+    int i;
+    for (i = 0; i < 18; i++)
+    {
+        if (lex.keysWords[i] == hash)
+        {
+            lex.token.type = i + 257;
+            return;
+        }
+    }
+    lex.token.u.str = tokenSaveStr(from, len, hash);
+    lex.token.type = TOKEN_IDENTIFIER;
+}
+/*
+ * skipComment() - 跳过注释
+ *
+ * 对当前位置加2跳过//字符,循环判断字符串是否是换行，如果是换行跳出循环
+ *
+ * Return:void
+ */
+void skipComment()
+{
+    lex.pos += 2;
+    lex.currChar = lex.content[lex.pos];
+    while (lex.currChar != '\n')
+    {
+        next_char();
+    }
+}
+/*
+ * skipBlank() - 跳过换行、注释、空白
+ *
+ * 循环判断当前字符时候是换行、注释、空白，如果是忽略内容
+ *
+ * Return:void
+ */
+void skipBlank()
+{
+    while (1)
+    {
+        switch (lex.currChar)
+        {
+        case '\n':
+        {
+            next_char();
+            lex.token.line++;
+            break;
+        }
+        case '/':
+        {
+            if (look_char() == '/')
+            {
+                skipComment();
+                break;
+            }
+            else
+            {
+                return;
+            }
+        }
+        case ' ':
+        case '\t':
+        case '\v':
+            next_char();
+            break;
+        default:
+            return;
+        }
+    }
+}
+/*
+ * nextToken() - 调用函数会产生下一个token
+ *
+ * 该方法是词法分析器的入口，语法分析器通过调用该函数会产生下一个TOKEN，通过TOKEN信息来确定适配对应的语法范式
+ * 在开始获得下一个token之前调用skipBlank函数跳过换行、注释、空白等内容，然后循环判断当前字符属于那些标识符
+ * 并把标识符信息保存在token中
+ *
+ * Return:void
+ */
+void nextToken()
+{
+    skipBlank();
+    lex.token.type = TOKEN_EOF;
+    lex.token.start = lex.pos;
+    switch (lex.currChar)
+    {
+    case '|':
+    {
+        if (look_char() == '|')
+        {
+            eat2Token(TOKEN_OR);
+        }
+        else
+        {
+            eatToken('|');
+        }
+        break;
+    }
+    case '&':
+    {
+        if (look_char() == '&')
+        {
+            eat2Token(TOKEN_AND);
+        }
+        else
+        {
+            eatToken('&');
+        }
+        break;
+    }
+    case '<':
+    {
+        if (look_char() == '=')
+        {
+            eat2Token(TOKEN_LT_EQ);
+        }
+        else
+        {
+            eatToken('<');
+        }
+        break;
+    }
+    case '>':
+    {
+        if (look_char() == '=')
+        {
+            eat2Token(TOKEN_GT_EQ);
+        }
+        else
+        {
+            eatToken('>');
+        }
+        break;
+    }
+    case '=':
+    {
+        if (look_char() == '=')
+        {
+            eat2Token(TOKEN_EQ);
+        }
+        else
+        {
+            eatToken('=');
+        }
+        break;
+    }
+    case '!':
+    {
+        if (look_char() == '=')
+        {
+            eat2Token(TOKEN_NOT_EQ);
+        }
+        else
+        {
+            eatToken('!');
+        }
+        break;
+    }
+    case '\0':
+    {
+        eatToken(TOKEN_EOF);
+        break;
+    }
+    case '"':
+    {
+        tokenString();
+        break;
+    }
+    default:
+    {
+        if (isdigit(lex.currChar))
+        {
+            tokenNumber();
+        }
+        else if (isalpha(lex.currChar) || lex.currChar == '_')
+        {
+            tokenIdentifier();
+        }
+        else
+        {
+            eatToken(lex.currChar);
+        }
+        break;
+    }
+    }
+}
+/*********************
+ * 以下语法分析器部分
+ *********************
+ */
+/*
+ * struct MyCompiler - myscript函数编译环境结构体
+ * @OBJECT_HEAD：对象头
+ * @inCode：字节码数组
+ * @lines：所在行数组
+ * @consts：常量数组
+ * @var：变量数组
+ * @name：函数名
+ * @argsNum：函数参数
+ * @maxOccupyStack：函数调起时将占用多少运行时栈
+ */
+typedef struct MyCompiler_
+{
+    OBJECT_HEAD
+    VecInt inCode;
+    VecInt lines;
+    VecValue consts;
+    VecVoid var;
+    StringObject *name;
+    int argsNum;
+    int maxOccupyStack;
+} MyCompiler;
+/*
+ * struct parser - 语法分析器结构体
+ * @top：最顶层编译环境（即全局编译环境）
+ * @curr：当前函数编译环境
+ * @head：函数编译环境链表的头节点
+ * @tabElse：else数组，goto字节码跳转位置时用到
+ * @tabBreak：break数组，goto字节码跳转位置时用到
+ * @tabFor：for数组，for循环中末尾循环体字节码信息保存在该数组中
+ * @tabLine：line数组，for循环中末尾循环体字节码对应的行信息保存在该数组中
+ */
+typedef struct Parser_
+{
+    MyCompiler *top;
+    MyCompiler *curr;
+    MyCompiler *head;
+    VecInt tabElse;
+    VecInt tabBreak;
+    VecInt tabFor;
+    VecInt tabLine;
+} Parser;
 
-typedef struct MyParserObject_ {
-	PARSER_HEAD
-} MyParserObject;
+Parser parser; /*全局语法分析器*/
 
-typedef struct BuiltinObject_ {
-	OBJECT_HEAD
-	int args_n;
-	void (*in_func)(int args_n, Value *args);
-} BuiltinObject;
+/*
+ * initCompiler(StringObject *name) - 初始化函数编译环境对象
+ * @name:编译环境名
+ *
+ * 给MyCompiler对象分配内存，初始化各个成员变量，并把MyCompiler对象加入到语法分析器的head链表中
+ *
+ * Return:函数编译环境对象
+ */
+MyCompiler *initCompiler(StringObject *name)
+{
+    MyCompiler *c = (MyCompiler *)malloc(sizeof(MyCompiler));
+    c->mark = 0;
+    c->next = NULL;
+    c->type = COMPILER_OBJ;
+    initIntVec(&c->inCode, INIT_INCODE);
+    initIntVec(&c->lines, INIT_INCODE);
+    initValueVec(&c->consts, INIT_CONST);
+    initVoidVec(&c->var, INIT_VAR);
+    c->name = name;
+    c->argsNum = 0;
+    c->maxOccupyStack = 0;
+    c->next = (MyObject *)parser.head;
+    parser.head = c;
+    return c;
+}
+/*
+ * initParser(MyCompiler *top) - 初始化语法分析器
+ * @top:最顶层的编译环境（即全局编译环境）
+ *
+ * 给MyCompiler对象分配内存，初始化各个成员变量，并把MyCompiler对象加入到语法分析器的head链表中
+ *
+ * Return:void
+ */
+void initParser(MyCompiler *top)
+{
+    parser.top = top;
+    parser.curr = top;
+    parser.head = top;
+    initIntVec(&parser.tabElse, INIT_PARSER_TAB);
+    initIntVec(&parser.tabBreak, INIT_PARSER_TAB);
+    initIntVec(&parser.tabFor, INIT_PARSER_TAB);
+    initIntVec(&parser.tabLine, INIT_PARSER_TAB);
+}
+/*
+ * saveIncode(int op, int v) - 保存操作码及操作值到当前编译环境的字节码数组中
+ * @op:操作码
+ * @v:操作值
+ *
+ * 枚举类型OpKind的字节码转化成int类型，如果数值小于12说明，该操作码会使运行栈的栈顶加1，所以maxOccupyStack自增1
+ * 在保存操作码及操作值的同时保存操作码所在的文本行信息
+ *
+ * Return:void
+ */
+void saveIncode(int op, int v)
+{
+    if (op < 12)
+    {
+        parser.curr->maxOccupyStack++;
+    }
+    pushIntVec(&parser.curr->inCode, op);
+    pushIntVec(&parser.curr->inCode, v);
+    pushIntVec(&parser.curr->lines, lex.token.line);
+    pushIntVec(&parser.curr->lines, lex.token.line);
+}
+/*
+ * saveIncodeOp(int op) - 只保存操作码到当前编译环境的字节码数组中
+ * @op:操作码
+ *
+ * 有些操作码后面没有操作值，例如:OP_CONST_NULL,所以只用保存操作码
+ *
+ * Return:void
+ */
+void saveIncodeOp(int op)
+{
+    if (op < 12)
+    {
+        parser.curr->maxOccupyStack++;
+    }
+    pushIntVec(&parser.curr->inCode, op);
+    pushIntVec(&parser.curr->lines, lex.token.line);
+}
+/*
+ * saveConst(int op, Value v) - 保存常量到当前编译环境的常量数组中及操作码到字节码数组中
+ * @op:操作码
+ * @v:常量
+ *
+ * 函数保存常量到当前编译环境的常量数组中并把操作码与常量所在常量数组的位置当作操作值一起保存在字节码数组
+ *
+ * Return:void
+ */
+void saveConst(int op, Value v)
+{
+    pushValueVec(&parser.curr->consts, v);
+    saveIncode(op, parser.curr->consts.n - 1);
+}
+/*
+ * saveNoneVar() - 保存一个空的变量到当前编译环境的变量数组中
+ *
+ * 变量会占用运行时栈，在保存变量的时候需要maxOccupyStack自增1
+ *
+ * Return:变量所在变量数组中的位置
+ */
+int saveNoneVar()
+{
+    pushVoidVec(&parser.curr->var, NULL);
+    parser.curr->maxOccupyStack++;
+    return parser.curr->var.n - 1;
+}
+/*
+ * getLocalVar(StringObject *str) - 在当前编译环境中查找变量
+ * @str:变量
+ *
+ * 在当前编译环境的变量数组中通过倒序的方式查找变量，因为通常情况一个变量赋值完就会使用，所以先查找最后保存的，最后查找最先保存的
+ * 如果查询到返回变量所在变量数组中的位置，如果查询不到返回-1
+ *
+ * Return:变量所在变量数组中的位置
+ */
+int getLocalVar(StringObject *str)
+{
+    int i;
+    for (i = parser.curr->var.n - 1; i >= 0; i--)
+    {
+        StringObject *v = parser.curr->var.data[i];
+        if (v != NULL && v->hash == str->hash)
+        {
+            return i;
+        }
+    }
+    return -1;
+}
+/*
+ * saveLocalVar(StringObject *str) - 保存变量到当前编译环境中
+ * @str:变量
+ *
+ * 先查找当前编译环境是否有该变量，如果有返回变量所在变量数组中的位置
+ * 如果没有，把变量插入到当前编译环境变量数组的最后的位置，并返回位置的索引
+ *
+ * Return:变量所在变量数组中的位置
+ */
+int saveLocalVar(StringObject *str)
+{
+    int i = getLocalVar(str);
+    if (i != -1)
+    {
+        return i;
+    }
+    pushVoidVec(&parser.curr->var, str);
+    parser.curr->maxOccupyStack++;
+    return parser.curr->var.n - 1;
+}
+/*
+ * loadVar(StringObject *str)  - 根据变量及环境确定加载变量时使用何种操作码
+ * @str:变量
+ *
+ * 当编译时遇到一个变量，如果当前编译环境不是全局编译环境（在函数中）且在当前编译环境中能查找到变量
+ * 操作码是OP_LOAD，操作值是变量所在当前编译环境变量数组中的位置，
+ * 如果当前编译环境是全局编译环境（在全局中）或在当前编译环境中不能查找到变量
+ * 操作码是OP_LOAD_GLOBAL，操作值是变量所在当前编译环境常量数组中的位置
+ * 函数在编译阶段告诉虚拟机使用那种操作码加载变量
+ * OP_LOAD操作码将在运行时栈函数帧中的操作值位置加载变量的值到运行时栈的栈顶
+ * OP_LOAD_GLOBAL操作码将将在运行时在全局变量哈希map中加载变量值到运行时栈的栈顶
+ *
+ * Return:void
+ */
+void loadVar(StringObject *str)
+{
+    int pos = getLocalVar(str);
+    if (pos != -1 && parser.top != parser.curr)
+    {
+        saveIncode(OP_LOAD, pos);
+    }
+    else
+    {
+        saveConst(OP_LOAD_GLOBAL, obj_to_val(str));
+    }
+}
+/*
+ * storeVar(StringObject *str)  - 根据变量及环境确定赋值变量时使用何种操作码
+ * @str:变量
+ *
+ * 当编译时遇到需要赋值一个变量，如果当前编译环境是全局编译环境
+ * 操作码是OP_STORE_GLOBAL，操作值是变量所在当前编译环境常量数组中的位置，
+ * 如果当前编译环境不是全局编译环境，调用saveLocalVar保存变量
+ * 操作码是OP_STORE，操作值是变量所在当前编译环境变量数组中的位置
+ *
+ * Return:void
+ */
+void storeVar(StringObject *str)
+{
+    if (parser.top == parser.curr)
+    {
+        saveConst(OP_STORE_GLOBAL, obj_to_val(str));
+    }
+    else
+    {
+        int pos = saveLocalVar(str);
+        saveIncode(OP_STORE, pos);
+    }
+}
+/*
+ * checkToken(int tokenType)  - 校验当前token类型是否于传入的token类型一致
+ * @tokenType:token类型
+ *
+ * 如果与传入token类型不一致打印错误信息并退出
+ *
+ * Return:void
+ */
+void checkToken(int tokenType)
+{
+    if (lex.token.type != tokenType)
+    {
+        syntaxError("token appear here does not match expected");
+    }
+}
+/*
+ * checkSkip(int tokenType)  - 校验当前token类型是否于传入的token类型一致并跳过该token
+ * @tokenType:token类型
+ *
+ * 如果校验传入token类型一致，调用nextToken产生下一个token
+ *
+ * Return:void
+ */
+void checkSkip(int tokenType)
+{
+    checkToken(tokenType);
+    nextToken();
+}
+void exprRvalue();
+/*
+ * exprCommaList()  - 逗号分割表达式
+ *
+ * 范式:exprCommaList -> exprRvalue {',' exprRvalue}
+ *
+ * 该表达式的使用场景，例如调用函数时传递参数f(a,b,c,d),这里参数a,b,c,d需要用到该范式
+ *
+ * Return:逗号分割表达式的数量
+ */
+int exprCommaList()
+{
+    int n = 1;
+    exprRvalue();
+    while (lex.token.type == ',')
+    {
+        nextToken();
+        exprRvalue();
+        n++;
+    }
+    return n;
+}
+/*
+ * exprBracket()  - 括号表达式
+ *
+ * 范式:exprBracket -> '(' exprCommaList ')'
+ *
+ * 该表达式的使用场景，例如调用函数时传递参数f(a,b,c,d),这里括号部分需要用到该范式
+ *
+ * Return:逗号分割表达式的数量
+ */
+int exprBracket()
+{
+    int n = 0;
+    checkSkip('(');
+    if (lex.token.type != ')')
+    {
+        n = exprCommaList();
+    }
+    checkSkip(')');
+    return n;
+}
+/*
+ * struct ExprType - 表达式类型
+ * @flag：表达式标识（0代表无,1是变量，2是成员，3是字符串，4是索引，5是方法调起，6是其他）
+ * @str：字符串（flag是1时str是变量，2是str是成员变量）
+ */
+typedef struct ExprType_
+{
+    int flag;
+    StringObject *str;
+} ExprType;
+/*
+ * exprComplex()  - 复合表达式
+ *
+ * 范式:exprComplex -> ( IDENTIFIER | STRING |'(' exprRvalue ')'| this | super )
+ *                          { '.' IDENTIFIER [ exprBracket ] | '[' exprRvalue ']' | exprBracket }
+ *
+ * 该表达式的场景，例如 变量，字符串，this，super，()括号包裹的部分，后面可以存在:成员变量object.member,
+ * 成员函数的调用:object.toString(),索引的调用list[1],函数的调用f(a,b,c)
+ * 该表达式匹配完会判断下一个token是否是赋值语句，如果是赋值语句会返回表达式类型，如果不是赋值语句会生成对应的操作码及操作值写入字节码数组
+ *
+ * Return:表达式类型
+ */
+ExprType exprComplex()
+{
+    ExprType e;
+    e.flag = 0;
+    e.str = NULL;
+    switch (lex.token.type)
+    {
+    case TOKEN_IDENTIFIER:
+    {
+        e.flag = 1;
+        e.str = lex.token.u.str;
+        nextToken();
+        if (lex.token.type == '=')
+        {
+            return e;
+        }
+        loadVar(e.str);
+        break;
+    }
+    case TOKEN_STRING:
+    {
+        e.flag = 3;
+        e.str = lex.token.u.str;
+        nextToken();
+        saveConst(OP_PUSH, obj_to_val(e.str));
+        break;
+    }
+    case '(':
+    {
+        e.flag = 6;
+        nextToken();
+        exprRvalue();
+        checkSkip(')');
+        break;
+    }
+    case TOKEN_THIS:
+    {
+        e.flag = 6;
+        nextToken();
+        saveIncodeOp(OP_THIS);
+        break;
+    }
+    case TOKEN_SUPER:
+    {
+        e.flag = 6;
+        nextToken();
+        saveIncodeOp(OP_SUPER);
+        break;
+    }
+    default:
+        break;
+    }
+    while (1)
+    {
+        switch (lex.token.type)
+        {
+        case '.':
+        {
+            if (e.flag == 0)
+            {
+                syntaxError("no calls can appear here");
+            }
+            nextToken();
+            checkToken(TOKEN_IDENTIFIER);
+            e.flag = 2;
+            e.str = lex.token.u.str;
+            nextToken();
+            if (lex.token.type == '=')
+            {
+                return e;
+            }
+            else if (lex.token.type == '(')
+            {
+                e.flag = 5;
+                int count = exprBracket();
+                saveIncode(OP_CONST_INT, count);
+                saveConst(OP_METHOD_CALL, obj_to_val(e.str));
+            }
+            else
+            {
+                saveConst(OP_LOAD_ATTR, obj_to_val(e.str));
+            }
+            break;
+        }
+        case '[':
+        {
+            if (e.flag == 0 || e.flag == 3 || e.flag == 6)
+            {
+                syntaxError("index call error");
+            }
+            e.flag = 4;
+            nextToken();
+            exprRvalue();
+            checkSkip(']');
+            if (lex.token.type == '=')
+            {
+                return e;
+            }
+            saveIncodeOp(OP_INDEX);
+            break;
+        }
+        case '(':
+        {
+            if (e.flag == 0 || e.flag == 3 || e.flag == 6)
+            {
+                syntaxError("function call can not appear here");
+            }
+            e.flag = 5;
+            saveIncode(OP_FUNC_CALL, exprBracket());
+            break;
+        }
+        default:
+        {
+            return e;
+        }
+        }
+    }
+    return e;
+}
+/*
+ * exprBase()  - 基础表达式
+ *
+ * 范式:exprBase -> NULL | TRUE | FALSE | NUMBER | exprComplex
+ *
+ * Return:void
+ */
+void exprBase()
+{
+    switch (lex.token.type)
+    {
+    case TOKEN_NULL:
+    {
+        saveIncodeOp(OP_CONST_NULL);
+        nextToken();
+        break;
+    }
+    case TOKEN_TRUE:
+    {
+        saveIncodeOp(OP_CONST_TRUE);
+        nextToken();
+        break;
+    }
+    case TOKEN_FALSE:
+    {
+        saveIncodeOp(OP_CONST_FALSE);
+        nextToken();
+        break;
+    }
+    case TOKEN_NUMBER:
+    {
+        saveConst(OP_PUSH, num_to_val(lex.token.u.number));
+        nextToken();
+        break;
+    }
+    default:
+    {
+        exprComplex();
+        break;
+    }
+    }
+}
+/*
+ * exprPrefix()  - 前缀表达式
+ *
+ * 范式:exprPrefix -> [ '!' | '-' exprPrefix ]  | exprBase
+ * 如果前面有取非操作符或者取负操作符递归调用exprPrefix，没有调用exprBase
+ *
+ * Return:void
+ */
+void exprPrefix()
+{
+    if (lex.token.type == '!' || lex.token.type == '-')
+    {
+        int op = lex.token.type;
+        nextToken();
+        exprPrefix();
+        if (op == '!')
+        {
+            saveIncodeOp(OP_NOT);
+        }
+        else if (op == '-')
+        {
+            saveIncodeOp(OP_MINUS);
+        }
+    }
+    else
+    {
+        exprBase();
+    }
+}
+/*
+ * exprMulDiv()  - 乘除表达式
+ *
+ * 范式:exprMulDiv -> exprPrefix { '*' | '/' exprPrefix }
+ *
+ * Return:void
+ */
+void exprMulDiv()
+{
+    exprPrefix();
+    while (lex.token.type == '*' || lex.token.type == '/')
+    {
+        int op = lex.token.type;
+        nextToken();
+        exprPrefix();
+        if (op == '*')
+        {
+            saveIncodeOp(OP_MUL);
+        }
+        else
+        {
+            saveIncodeOp(OP_DIV);
+        }
+    }
+}
+/*
+ * exprPlusMinus()  - 加减表达式
+ *
+ * 范式:exprPlusMinus -> exprMulDiv { '+' | '-' exprMulDiv }
+ *
+ * Return:void
+ */
+void exprPlusMinus()
+{
+    exprMulDiv();
+    while (lex.token.type == '+' || lex.token.type == '-')
+    {
+        int op = lex.token.type;
+        nextToken();
+        exprMulDiv();
+        if (op == '+')
+        {
+            saveIncodeOp(OP_PLUS);
+        }
+        else
+        {
+            saveIncodeOp(OP_SUB);
+        }
+    }
+}
+/*
+ * exprBoolean()  - 判断大小表达式
+ *
+ * 范式:exprBoolean -> exprPlusMinus { '>' | '<' | '>=' | '<=' exprPlusMinus }
+ *
+ * Return:void
+ */
+void exprBoolean()
+{
+    exprPlusMinus();
+    while (1)
+    {
+        switch (lex.token.type)
+        {
+        case '>':
+        {
+            nextToken();
+            exprPlusMinus();
+            saveIncodeOp(OP_GT);
+            break;
+        }
+        case '<':
+        {
+            nextToken();
+            exprPlusMinus();
+            saveIncodeOp(OP_LT);
+            break;
+        }
+        case TOKEN_LT_EQ:
+        {
+            nextToken();
+            exprPlusMinus();
+            saveIncodeOp(OP_LT_EQ);
+            break;
+        }
+        case TOKEN_GT_EQ:
+        {
+            nextToken();
+            exprPlusMinus();
+            saveIncodeOp(OP_GT_EQ);
+            break;
+        }
+        default:
+            return;
+        }
+    }
+}
+/*
+ * exprEqual()  - 判断相等表达式
+ *
+ * 范式:exprEqual -> exprBoolean { '==' | '!='  exprBoolean }
+ *
+ * Return:void
+ */
+void exprEqual()
+{
+    exprBoolean();
+    while (lex.token.type == TOKEN_EQ || lex.token.type == TOKEN_NOT_EQ)
+    {
+        int op = lex.token.type;
+        nextToken();
+        exprBoolean();
+        if (op == TOKEN_EQ)
+        {
+            saveIncodeOp(OP_EQ);
+        }
+        else
+        {
+            saveIncodeOp(OP_NOT_EQ);
+        }
+    }
+}
+/*
+ * exprLogicalAnd()  - 且表达式
+ *
+ * 范式:exprLogicalAnd -> exprEqual { '&&'   exprEqual }
+ *
+ * Return:void
+ */
+void exprLogicalAnd()
+{
+    exprEqual();
+    while (lex.token.type == TOKEN_AND)
+    {
+        nextToken();
+        exprEqual();
+        saveIncodeOp(OP_AND);
+    };
+}
+/*
+ * exprLogicalOr()  - 或表达式
+ *
+ * 范式:exprLogicalOr -> exprLogicalAnd { '||'   exprLogicalAnd }
+ *
+ * Return:void
+ */
+void exprLogicalOr()
+{
+    exprLogicalAnd();
+    while (lex.token.type == TOKEN_OR)
+    {
+        nextToken();
+        exprLogicalAnd();
+        saveIncodeOp(OP_OR);
+    };
+}
+/*
+ * exprMap()  - 哈希map表达式
+ *
+ * 范式:exprMap -> '{' [ IDENTIFIER ':' exprRvalue {',' IDENTIFIER ':' exprRvalue } ] '}'
+ *
+ * Return:void
+ */
+void exprMap()
+{
+    checkSkip('{');
+    int n = 0;
+    while (lex.token.type == TOKEN_IDENTIFIER || lex.token.type == TOKEN_STRING)
+    {
+        saveConst(OP_PUSH, obj_to_val(lex.token.u.str));
+        nextToken();
+        if (lex.token.type == ':')
+        {
+            nextToken();
+            exprRvalue();
+        }
+        else
+        {
+            syntaxError("missing colon error");
+        }
+        n++;
+        if (lex.token.type == ',')
+        {
+            nextToken();
+        }
+        else if (lex.token.type == '}')
+        {
+            break;
+        }
+        else
+        {
+            syntaxError("token appear here does not match expected");
+        }
+    }
+    checkSkip('}');
+    saveIncode(OP_BUILD_MAP, n);
+}
+/*
+ * exprArray()  - 列表表达式
+ *
+ * 范式:exprArray -> '[' exprCommaList ']'
+ *
+ * Return:void
+ */
+void exprArray()
+{
+    int n = 0;
+    checkSkip('[');
+    if (lex.token.type != ']')
+    {
+        n = exprCommaList();
+    }
+    checkSkip(']');
+    saveIncode(OP_BUILD_LIST, n);
+}
+/*
+ * exprNew()  - 创建实例对象表达式
+ *
+ * 范式:exprNew -> NEW IDENTIFIER exprBracket
+ *
+ * Return:void
+ */
+void exprNew()
+{
+    saveConst(OP_LOAD_GLOBAL, obj_to_val(lex.token.u.str));
+    nextToken();
+    int n = exprBracket();
+    saveIncode(OP_BUILD_OBJECT, n);
+}
+void blockState();
+/*
+ * exprLambda()  - 创建匿名函数表达式
+ *
+ * 范式:exprLambda -> (' [ IDENTIFIER { ',' IDENTIFIER } ] ')' blockState
+ *
+ * Return:void
+ */
+void exprLambda(StringObject *name)
+{
+    MyCompiler *prev = parser.curr;
+    MyCompiler *c = initCompiler(name);
+    parser.curr = c;
+    saveNoneVar();
+    int argsNum = 0;
+    checkSkip('(');
+    while (lex.token.type == TOKEN_IDENTIFIER)
+    {
+        saveLocalVar(lex.token.u.str);
+        nextToken();
+        argsNum++;
+        if (lex.token.type == ')')
+        {
+            break;
+        }
+        checkSkip(',');
+    }
+    checkSkip(')');
+    blockState();
+    saveIncodeOp(OP_CONST_NULL);
+    saveIncodeOp(OP_RETURN);
+    parser.curr->argsNum = argsNum;
+    parser.curr = prev;
+    saveConst(OP_PUSH, obj_to_val(c));
+}
+/*
+ * exprRvalue()  - 右值表达式
+ *
+ * 范式:exprRvalue -> exprMap | exprArray | exprNew | exprLambda | exprLogicalOr
+ * 右值表达式是赋值语句等号右边的值
+ *
+ * Return:void
+ */
+void exprRvalue()
+{
+    switch (lex.token.type)
+    {
+    case '{':
+    {
+        exprMap();
+        break;
+    }
+    case '[':
+    {
+        exprArray();
+        break;
+    }
+    case TOKEN_NEW:
+    {
+        nextToken();
+        exprNew();
+        break;
+    }
+    case TOKEN_FUNCTION:
+    {
+        nextToken();
+        exprLambda(NULL);
+        break;
+    }
+    default:
+        exprLogicalOr();
+        break;
+    }
+}
+/*
+ * exprState()  - 表达式语句
+ *
+ * 范式:exprState -> exprComplex | exprComplex '=' exprRvalue
+ * 表达式语句包含表达式所有的操作类型，任何表达式都可以通过该表达式语句找到对应的范式
+ * 例如：赋值操作，如：a=2+3*5，单独的函数调用，如：a() 等都可以通过该表达式解析
+ *
+ * Return:void
+ */
+void exprState()
+{
+    ExprType e = exprComplex();
+    if (lex.token.type != '=')
+    {
+        return;
+    }
+    nextToken();
+    exprRvalue();
+    switch (e.flag)
+    {
+    case 1:
+    {
+        storeVar(e.str);
+        break;
+    }
+    case 2:
+    {
+        saveConst(OP_STORE_ATTR, obj_to_val(e.str));
+        break;
+    }
+    case 4:
+    {
+        saveIncodeOp(OP_STORE_INDEX);
+        break;
+    }
+    default:
+    {
+        syntaxError("assignment error");
+        break;
+    }
+    }
+}
+/*
+ * varState()  - 全局变量赋值语句
+ *
+ * 范式:varState -> var IDENTIFIER '=' exprRvalue
+ * 例如：var a = 2+3*5 ;该语句变量即使是在函数内被赋值，变量依然是全局变量
+ *
+ * Return:void
+ */
+void varState()
+{
+    checkToken(TOKEN_IDENTIFIER);
+    StringObject *name = lex.token.u.str;
+    checkSkip('=');
+    exprRvalue();
+    saveConst(OP_STORE_GLOBAL, obj_to_val(name));
+}
+void statements();
+/*
+ * blockState()  - 语句块
+ *
+ * 范式:blockState -> '{' statements '}'
+ *
+ * Return:void
+ */
+void blockState()
+{
+    checkSkip('{');
+    while (lex.token.type != '}')
+    {
+        statements();
+    }
+    checkSkip('}');
+}
+/*
+ * whileState()  - while循环语句
+ *
+ * 范式:whileState -> WHILE '(' exprRvalue ')' blockState
+ *
+ * Return:void
+ */
+void whileState()
+{
+    checkSkip('(');
+    int top = parser.tabBreak.n;
+    tag_label(mark0);
+    exprRvalue();
+    tag_label(mark1);
+    saveIncode(OP_GOTO_IF_FALSE, 0);
+    checkSkip(')');
+    blockState();
+    saveIncode(OP_GOTO, mark0);
+    int max = parser.tabBreak.n;
+    while (top < max)
+    {
+        int pos = popIntVec(&parser.tabBreak);
+        set_label(pos + 1);
+        top++;
+    }
+    set_label(mark1 + 1);
+}
+void forOfState(StringObject *name)
+{
+    nextToken();
+    exprRvalue();
+    checkSkip(')');
+    int arrayPoint = saveNoneVar();
+    saveIncode(OP_STORE, arrayPoint);
+    saveIncode(OP_LOAD, arrayPoint);
+    saveIncodeOp(OP_ARRAY_LENGTH);
+    int arrayLength = saveNoneVar();
+    saveIncode(OP_STORE, arrayLength);
+    saveIncode(OP_CONST_INT, 0);
+    int counter = saveNoneVar();
+    saveIncode(OP_STORE, counter);
+    tag_label(mark0);
+    saveIncode(OP_LOAD, counter);
+    saveIncode(OP_LOAD, arrayLength);
+    saveIncodeOp(OP_LT);
+    tag_label(mark1);
+    saveIncode(OP_GOTO_IF_FALSE, 0);
+    saveIncode(OP_LOAD, arrayPoint);
+    saveIncode(OP_LOAD, counter);
+    saveIncodeOp(OP_INDEX);
+    storeVar(name);
+    blockState();
+    saveIncode(OP_PLUS_SELF, counter);
+    saveIncode(OP_GOTO, mark0);
+    set_label(mark1 + 1);
+}
+void forSubSate()
+{
+    tag_label(mark0);
+    int mark1 = -1;
+    int num = -1;
+    if (lex.token.type == ';')
+    {
+        nextToken();
+    }
+    else
+    {
+        exprRvalue();
+        mark1 = parser.curr->inCode.n;
+        saveIncode(OP_GOTO_IF_FALSE, 0);
+        checkSkip(';');
+    }
+    if (lex.token.type == ')')
+    {
+        nextToken();
+    }
+    else
+    {
+        tag_label(top);
+        exprState();
+        num = parser.curr->inCode.n - top;
+        int i;
+        for (i = 0; i < num; i++)
+        {
+            int code = popIntVec(&parser.curr->inCode);
+            int line = popIntVec(&parser.curr->lines);
+            pushIntVec(&parser.tabFor, code);
+            pushIntVec(&parser.tabLine, line);
+        }
+        checkSkip(')');
+    }
+    blockState();
+    if (num != -1)
+    {
+        int i;
+        for (i = 0; i < num; i++)
+        {
+            int code = popIntVec(&parser.tabFor);
+            int line = popIntVec(&parser.tabLine);
+            pushIntVec(&parser.curr->inCode, code);
+            pushIntVec(&parser.curr->lines, line);
+        }
+    }
+    saveIncode(OP_GOTO, mark0);
+    if (mark1 != -1)
+    {
+        set_label(mark1 + 1);
+    }
+}
+/*
+ * forState()  - for循环语句
+ *
+ * 范式1:forState -> for '(' IDENTIFIER OF exprRvalue ')' blockState
+ * 范式2:forState -> for '(' [ IDENTIFIER '=' exprRvalue ] ';' [ exprState ] ';' [ exprState ] ')' blockState
+ * for循环语句包含两个范式，第一个范式是for of语句，第二个范式是for循环常规的用法
+ *
+ * Return:void
+ */
+void forState()
+{
+    checkSkip('(');
+    int top = parser.tabBreak.n;
+    if (lex.token.type == TOKEN_IDENTIFIER)
+    {
+        StringObject *name = lex.token.u.str;
+        nextToken();
+        if (lex.token.type == TOKEN_OF)
+        {
+            forOfState(name);
+        }
+        else if (lex.token.type == '=')
+        {
+            nextToken();
+            exprRvalue();
+            storeVar(name);
+            checkSkip(';');
+            forSubSate();
+        }
+        else
+        {
+            syntaxError("an error occurred here");
+        }
+    }
+    else if (lex.token.type == ';')
+    {
+        nextToken();
+        forSubSate();
+    }
+    else
+    {
+        syntaxError("an error occurred here");
+    }
+    int max = parser.tabBreak.n;
+    while (top < max)
+    {
+        int pos = popIntVec(&parser.tabBreak);
+        set_label(pos + 1);
+        top++;
+    }
+}
+/*
+ * classBody()  - class语句主体块
+ *
+ * 范式:classBody -> '{' { IDENTIFIER '=' exprRvalue | IDENTIFIER exprLambda [ ';' ] } '}'
+ *
+ * Return:class语句成员变量的数量
+ */
+int classBody()
+{
+    checkSkip('{');
+    int cnt = 0;
+    while (lex.token.type == TOKEN_IDENTIFIER)
+    {
+        StringObject *name = lex.token.u.str;
+        saveConst(OP_PUSH, obj_to_val(name));
+        nextToken();
+        switch (lex.token.type)
+        {
+        case '=':
+        {
+            nextToken();
+            exprRvalue();
+            break;
+        }
+        case '(':
+        {
+            exprLambda(name);
+            break;
+        }
+        default:
+        {
+            syntaxError("an error occurred here");
+        }
+        }
+        if (lex.token.type == ';')
+        {
+            nextToken();
+        }
+        cnt++;
+    }
+    checkSkip('}');
+    return cnt;
+}
+/*
+ * classState()  - class语句
+ *
+ * 范式:classState -> class IDENTIFIER [ EXTENDS IDENTIFIER ] classBody
+ *
+ * Return:void
+ */
+void classState()
+{
+    if (parser.curr != parser.top)
+    {
+        syntaxError("class must be defined at the global");
+    }
+    checkToken(TOKEN_IDENTIFIER);
+    StringObject *name = lex.token.u.str;
+    nextToken();
+    StringObject *superName = NULL;
+    if (lex.token.type == TOKEN_EXTENDS)
+    {
+        nextToken();
+        checkToken(TOKEN_IDENTIFIER);
+        superName = lex.token.u.str;
+        nextToken();
+    }
+    int cnt = classBody();
+    saveIncode(OP_CONST_INT, cnt);
+    if (superName == NULL)
+    {
+        saveIncodeOp(OP_CONST_NULL);
+    }
+    else
+    {
+        saveConst(OP_LOAD_GLOBAL, obj_to_val(superName));
+    }
+    saveConst(OP_BUILD_CLASS, obj_to_val(name));
+}
 
-typedef struct ModuleObject_ {
-	PARSER_HEAD
-	VectorInt else_e;
-	VectorInt break_e;
-	VectorInstr for_e;
-} ModuleObject;
-
-typedef struct FunctionObject_ {
-	PARSER_HEAD
-	MyParserObject *prev;
-	int args_num;
-} FunctionObject;
-
-typedef struct ClassCodeObject_ {
-	PARSER_HEAD
-	int super_pos;
-} ClassCodeObject;
-
-typedef struct InstanceObject_ {
-	OBJECT_HEAD
-	VectorField fields;
+/*
+ * funcState()  - 函数语句
+ *
+ * 范式:funcState -> function IDENTIFIER exprLambda
+ *
+ * Return:void
+ */
+void funcState()
+{
+    checkToken(TOKEN_IDENTIFIER);
+    StringObject *name = lex.token.u.str;
+    nextToken();
+    exprLambda(name);
+    storeVar(name);
+}
+/*
+ * ifState()  - if语句
+ *
+ * 范式:ifState -> if '(' exprRvalue ')' blockState { else if '(' exprRvalue ')' blockState } [ else blockState ]
+ *
+ * Return:void
+ */
+void ifState()
+{
+    checkSkip('(');
+    exprRvalue();
+    tag_label(mark0);
+    saveIncode(OP_GOTO_IF_FALSE, 0);
+    checkSkip(')');
+    blockState();
+    tag_label(mark1);
+    saveIncode(OP_GOTO, 0);
+    set_label(mark0 + 1);
+    int flag = 0;
+    int top = parser.tabElse.n;
+    while (lex.token.type == TOKEN_ELSE)
+    {
+        nextToken();
+        if (lex.token.type == '{')
+        {
+            if (flag == 1)
+            {
+                syntaxError("an error occurred here");
+            }
+            flag = 1;
+            blockState();
+            break;
+        }
+        while (lex.token.type == TOKEN_IF)
+        {
+            if (flag == 1)
+            {
+                syntaxError("an error occurred here");
+            }
+            nextToken();
+            checkSkip('(');
+            exprRvalue();
+            tag_label(mark2);
+            saveIncode(OP_GOTO_IF_FALSE, 0);
+            checkSkip(')');
+            blockState();
+            tag_label(mark3);
+            pushIntVec(&parser.tabElse, mark3);
+            saveIncode(OP_GOTO, 0);
+            set_label(mark2 + 1);
+            break;
+        }
+    }
+    int max = parser.tabElse.n;
+    while (top < max)
+    {
+        int pos = popIntVec(&parser.tabElse);
+        set_label(pos + 1);
+        top++;
+    }
+    set_label(mark1 + 1);
+}
+/*
+ * breakState()  - break语句
+ *
+ * 范式:breakState ->  break ';'
+ *
+ * Return:void
+ */
+void breakState()
+{
+    tag_label(mark);
+    saveIncode(OP_GOTO, 0);
+    pushIntVec(&parser.tabBreak, mark);
+    checkSkip(';');
+}
+/*
+ * returnState()  - return语句
+ *
+ * 范式:returnState ->  return [ exprRvalue ] ';'
+ *
+ * Return:void
+ */
+void returnState()
+{
+    if (lex.token.type == ';' || lex.token.type == '}')
+    {
+        saveIncodeOp(OP_CONST_NULL);
+    }
+    else
+    {
+        exprRvalue();
+    }
+    saveIncodeOp(OP_RETURN);
+    checkSkip(';');
+}
+/*
+ * statements()  - 语句主体
+ *
+ * 范式:statements ->  ifState | whileState | forState | classState | funcState | breakState | returnState | varState | exprState
+ *
+ * Return:void
+ */
+void statements()
+{
+    switch (lex.token.type)
+    {
+    case TOKEN_IF:
+    {
+        nextToken();
+        ifState();
+        break;
+    }
+    case TOKEN_WHILE:
+    {
+        nextToken();
+        whileState();
+        break;
+    }
+    case TOKEN_FOR:
+    {
+        nextToken();
+        forState();
+        break;
+    }
+    case TOKEN_CLASS:
+    {
+        nextToken();
+        classState();
+        break;
+    }
+    case TOKEN_FUNCTION:
+    {
+        nextToken();
+        funcState();
+        break;
+    }
+    case TOKEN_BREAK:
+    {
+        nextToken();
+        breakState();
+        break;
+    }
+    case TOKEN_RETURN:
+    {
+        nextToken();
+        returnState();
+        break;
+    }
+    case TOKEN_VAR:
+    {
+        nextToken();
+        varState();
+        break;
+    }
+    default:
+    {
+        exprState();
+        checkSkip(';');
+        break;
+    }
+    }
+}
+/*
+ * startParser()  - 开始语法分析的入口
+ *
+ * 循环执行statements
+ *
+ * Return:void
+ */
+void startParser()
+{
+    nextToken();
+    while (lex.token.type != TOKEN_EOF)
+    {
+        statements();
+    }
+    saveIncodeOp(OP_CONST_NULL);
+    saveIncodeOp(OP_RETURN);
+}
+/*
+ * constString(char * tempStr,Value v) - 常量转字符串
+ * @tempStr:字符串
+ * @v:常量
+ *
+ * 函数根据常量的值，转化成对应的字符串,常量只包含三种类型，数值型、字符串型和编译环境型
+ *
+ * Return:void
+ */
+void constString(char *tempStr, Value v)
+{
+    if (v.type == NUMBER)
+    {
+        sprintf(tempStr, "NUMBER:%.14g", v.u.number);
+        return;
+    }
+    if (v.type == OBJECT)
+    {
+        if (v.u.object->type == STRING_OBJ)
+        {
+            char *s = ((StringObject *)v.u.object)->str;
+            snprintf(tempStr, 1024, "STRING:%s", s);
+            return;
+        }
+        if (v.u.object->type == COMPILER_OBJ)
+        {
+            char *s = ((MyCompiler *)v.u.object)->name->str;
+            snprintf(tempStr, 1024, "COMPILER:%s", s);
+            return;
+        }
+    }
+    printf("value type is error");
+    exit(1);
+}
+/*
+ * showCompiler(MyCompiler *c) - 展示编译环境的字节码信息
+ * @c:编译环境
+ *
+ * 循环当前编译环境的字节码输出对应的信息
+ * 第1列：字节码操作值所在的行
+ * 第2列：操作值在字节码的位置，goto跳转时会用到
+ * 第3列：操作码
+ * 第4列：操作值
+ * 第5列：操作值对应的含义，[]中括起来的内容是常量，<>中括起来的内容是变量
+ *
+ * Return:void
+ */
+void showCompiler(MyCompiler *c)
+{
+    char tempStr[1024];
+    printf(">>>complier module is:%s,arguments number is %d \n", c->name->str, c->argsNum);
+    printf(">>>complier module code: \n");
+    Value *consts = c->consts.data;
+    int *inData = c->inCode.data;
+    int line, v, ip;
+    char *str;
+    for (ip = 0; ip < c->inCode.n; ip++)
+    {
+        line = c->lines.data[ip];
+        switch (inData[ip])
+        {
+        case OP_PUSH:
+        {
+            v = OP_VALUE;
+            constString(tempStr, consts[v]);
+            printf("%-6d|%-6d|%-20s %-6d [%s] \n", line, ip, "OP_PUSH", v, tempStr);
+            break;
+        }
+        case OP_LOAD:
+        {
+            v = OP_VALUE;
+            if (c->var.data[v] == NULL)
+            {
+                str = "NULL";
+            }
+            else
+            {
+                str = ((StringObject *)(c->var.data[v]))->str;
+            }
+            printf("%-6d|%-6d|%-20s %-6d <%s> \n", line, ip, "OP_LOAD", v, str);
+            break;
+        }
+        case OP_LOAD_GLOBAL:
+        {
+            v = OP_VALUE;
+            constString(tempStr, consts[v]);
+            printf("%-6d|%-6d|%-20s %-6d [%s] \n", line, ip, "OP_LOAD_GLOBAL", v, tempStr);
+            break;
+        }
+        case OP_STORE_GLOBAL:
+        {
+            v = OP_VALUE;
+            constString(tempStr, consts[v]);
+            printf("%-6d|%-6d|%-20s %-6d [%s] \n", line, ip, "OP_STORE_GLOBAL", v, tempStr);
+            break;
+        }
+        case OP_STORE:
+        {
+            v = OP_VALUE;
+            if (c->var.data[v] == NULL)
+            {
+                str = "NULL";
+            }
+            else
+            {
+                str = ((StringObject *)(c->var.data[v]))->str;
+            }
+            printf("%-6d|%-6d|%-20s %-6d <%s> \n", line, ip, "OP_STORE", v, str);
+            break;
+        }
+        case OP_CONST_NULL:
+        {
+            printf("%-6d|%-6d|%s \n", line, ip, "OP_CONST_NULL");
+            break;
+        }
+        case OP_CONST_FALSE:
+        {
+            printf("%-6d|%-6d|%s \n", line, ip, "OP_CONST_FALSE");
+            break;
+        }
+        case OP_CONST_TRUE:
+        {
+            printf("%-6d|%-6d|%s \n", line, ip, "OP_CONST_TRUE");
+            break;
+        }
+        case OP_CONST_INT:
+        {
+            v = OP_VALUE;
+            printf("%-6d|%-6d|%-20s %-6d \n", line, ip, "OP_CONST_INT", v);
+            break;
+        }
+        case OP_BUILD_CLASS:
+        {
+            v = OP_VALUE;
+            constString(tempStr, consts[v]);
+            printf("%-6d|%-6d|%-20s %-6d [%s] \n", line, ip, "OP_BUILD_CLASS", v, tempStr);
+            break;
+        }
+        case OP_BUILD_OBJECT:
+        {
+            v = OP_VALUE;
+            printf("%-6d|%-6d|%-20s %-6d \n", line, ip, "OP_BUILD_OBJECT", v);
+            break;
+        }
+        case OP_BUILD_MAP:
+        {
+            v = OP_VALUE;
+            printf("%-6d|%-6d|%-20s %-6d \n", line, ip, "OP_BUILD_MAP", v);
+            break;
+        }
+        case OP_BUILD_LIST:
+        {
+            v = OP_VALUE;
+            printf("%-6d|%-6d|%-20s %-6d \n", line, ip, "OP_BUILD_LIST", v);
+            break;
+        }
+        case OP_PLUS_SELF:
+        {
+            v = OP_VALUE;
+            if (c->var.data[v] == NULL)
+            {
+                str = "NULL";
+            }
+            else
+            {
+                str = ((StringObject *)(c->var.data[v]))->str;
+            }
+            printf("%-6d|%-6d|%-20s %-6d <%s> \n", line, ip, "OP_PLUS_SELF", v, str);
+            break;
+        }
+        case OP_FUNC_CALL:
+        {
+            v = OP_VALUE;
+            printf("%-6d|%-6d|%-20s %-6d \n", line, ip, "OP_FUNC_CALL", v);
+            break;
+        }
+        case OP_METHOD_CALL:
+        {
+            v = OP_VALUE;
+            constString(tempStr, consts[v]);
+            printf("%-6d|%-6d|%-20s %-6d [%s] \n", line, ip, "OP_METHOD_CALL", v, tempStr);
+            break;
+        }
+        case OP_RETURN:
+        {
+            printf("%-6d|%-6d|%s \n", line, ip, "OP_RETURN");
+            break;
+        }
+        case OP_LOAD_ATTR:
+        {
+            v = OP_VALUE;
+            constString(tempStr, consts[v]);
+            printf("%-6d|%-6d|%-20s %-6d [%s] \n", line, ip, "OP_LOAD_ATTR", v, tempStr);
+            break;
+        }
+        case OP_STORE_ATTR:
+        {
+            v = OP_VALUE;
+            constString(tempStr, consts[v]);
+            printf("%-6d|%-6d|%-20s %-6d [%s] \n", line, ip, "OP_STORE_ATTR", v, tempStr);
+            break;
+        }
+        case OP_THIS:
+        {
+            printf("%-6d|%-6d|%s \n", line, ip, "OP_THIS");
+            break;
+        }
+        case OP_SUPER:
+        {
+            printf("%-6d|%-6d|%s \n", line, ip, "OP_SUPER");
+            break;
+        }
+        case OP_PLUS:
+        {
+            printf("%-6d|%-6d|%s \n", line, ip, "OP_PLUS");
+            break;
+        }
+        case OP_SUB:
+        {
+            printf("%-6d|%-6d|%s \n", line, ip, "OP_SUB");
+            break;
+        }
+        case OP_MUL:
+        {
+            printf("%-6d|%-6d|%s \n", line, ip, "OP_MUL");
+            break;
+        }
+        case OP_DIV:
+        {
+            printf("%-6d|%-6d|%s \n", line, ip, "OP_DIV");
+            break;
+        }
+        case OP_EQ:
+        {
+            printf("%-6d|%-6d|%s \n", line, ip, "OP_EQ");
+            break;
+        }
+        case OP_NOT_EQ:
+        {
+            printf("%-6d|%-6d|%s \n", line, ip, "OP_NOT_EQ");
+            break;
+        }
+        case OP_OR:
+        {
+            printf("%-6d|%-6d|%s \n", line, ip, "OP_OR");
+            break;
+        }
+        case OP_AND:
+        {
+            printf("%-6d|%-6d|%s \n", line, ip, "OP_AND");
+            break;
+        }
+        case OP_LT_EQ:
+        {
+            printf("%-6d|%-6d|%s \n", line, ip, "OP_LT_EQ");
+            break;
+        }
+        case OP_GT_EQ:
+        {
+            printf("%-6d|%-6d|%s \n", line, ip, "OP_GT_EQ");
+            break;
+        }
+        case OP_GT:
+        {
+            printf("%-6d|%-6d|%s \n", line, ip, "OP_GT");
+            break;
+        }
+        case OP_LT:
+        {
+            printf("%-6d|%-6d|%s \n", line, ip, "OP_LT");
+            break;
+        }
+        case OP_NOT:
+        {
+            printf("%-6d|%-6d|%s \n", line, ip, "OP_NOT");
+            break;
+        }
+        case OP_MINUS:
+        {
+            printf("%-6d|%-6d|%s \n", line, ip, "OP_MINUS");
+            break;
+        }
+        case OP_GOTO_IF_FALSE:
+        {
+            v = OP_VALUE;
+            printf("%-6d|%-6d|%-20s %-6d \n", line, ip, "OP_GOTO_IF_FALSE", v);
+            break;
+        }
+        case OP_GOTO:
+        {
+            v = OP_VALUE;
+            printf("%-6d|%-6d|%-20s %-6d \n", line, ip, "OP_GOTO", v);
+            break;
+        }
+        case OP_INDEX:
+        {
+            printf("%-6d|%-6d|%s \n", line, ip, "OP_INDEX");
+            break;
+        }
+        case OP_STORE_INDEX:
+        {
+            printf("%-6d|%-6d|%s \n", line, ip, "OP_STORE_INDEX");
+            break;
+        }
+        case OP_ARRAY_LENGTH:
+        {
+            printf("%-6d|%-6d|%s \n", line, ip, "OP_ARRAY_LENGTH");
+            break;
+        }
+        default:
+        {
+            printf("unreachable");
+            exit(1);
+        }
+        }
+    }
+}
+/*
+ * showParser(MyCompiler *top) - 展示全局编译的字节码信息
+ * @c:全局编译环境
+ *
+ * Return:void
+ */
+void showParser(MyCompiler *top)
+{
+    showCompiler(top);
+    int i;
+    for (i = 0; i < top->consts.n; i++)
+    {
+        Value v = top->consts.data[i];
+        if (v.type == OBJECT && v.u.object->type == COMPILER_OBJ)
+        {
+            printf("\n");
+            showCompiler((MyCompiler *)v.u.object);
+        }
+    }
+}
+/*********************
+ * 以下是虚拟机执行的部分
+ *********************
+ */
+/*
+ * struct HashNode - 哈希map节点
+ * @string：字符串
+ * @v：值
+ * @next：下一个节点
+ */
+typedef struct HashNode_
+{
+    StringObject *string;
+    Value v;
+    struct HashNode_ *next;
+} HashNode;
+/*
+ * struct HashMap - 哈希map
+ * @cap：哈希map容量
+ * @n：元素数量
+ * @hashNode：节点集合
+ */
+typedef struct HashMap_
+{
+    int cap;
+    int n;
+    HashNode **hashNode;
+} HashMap;
+/*
+ * struct MapObject - Map对象
+ * @OBJECT_HEAD：对象头
+ * @map：哈希map
+ */
+typedef struct MapObject_
+{
+    OBJECT_HEAD
+    HashMap map;
+} MapObject;
+/*
+ * struct ClassObject - class对象
+ * @OBJECT_HEAD：对象头
+ * @fields：成员变量
+ * @name：对象名
+ * @super：父类
+ */
+typedef struct ClassObject_
+{
+    OBJECT_HEAD
+    HashMap fields;
+    StringObject *name;
+    struct ClassObject_ *super;
+} ClassObject;
+/*
+ * struct InstanceObject - 实例对象
+ * @OBJECT_HEAD：对象头
+ * @fields：成员变量
+ * @inClass：实例对象所属类
+ */
+typedef struct InstanceObject_
+{
+    OBJECT_HEAD
+    HashMap fields;
+    ClassObject *inClass;
 } InstanceObject;
-
-typedef struct MethodObject_ {
-	OBJECT_HEAD
-	FunctionObject *func;
-	InstanceObject *inst;
-} MethodObject;
-
-void mark_class(MyObject *obj);
-void free_class(MyObject *obj);
-void mark_string(MyObject *obj);
-void free_string(MyObject *obj);
-void mark_list(MyObject *obj);
-void free_list(MyObject *obj);
-void mark_map(MyObject *obj);
-void free_map(MyObject *obj);
-void mark_module(MyObject *obj);
-void free_module(MyObject *obj);
-void mark_function(MyObject *obj);
-void free_function(MyObject *obj);
-void mark_class_code(MyObject *obj);
-void free_class_code(MyObject *obj);
-void mark_method(MyObject *obj);
-void free_method(MyObject *obj);
-void mark_builtin(MyObject *obj);
-void free_builtin(MyObject *obj);
-
-ClassObject G_class_class = { &G_class_class, 1, NULL, { NULL, 0, 0 }, 8, mark_class, free_class, NULL, NULL };
-ClassObject G_string_class = { &G_class_class, 1, NULL, { NULL, 0, 0 }, 3, mark_string, free_string, NULL, NULL };
-ClassObject G_list_class = { &G_class_class, 1, NULL, { NULL, 0, 0 }, 4, mark_list, free_list, NULL, NULL };
-ClassObject G_map_class = { &G_class_class, 1, NULL, { NULL, 0, 0 }, 5, mark_map, free_map, NULL, NULL };
-ClassObject G_module_class = { &G_class_class, 1, NULL, { NULL, 0, 0 }, 9, mark_module, free_module, NULL, NULL };
-ClassObject G_function_class = { &G_class_class, 1, NULL, { NULL, 0, 0 }, 9, mark_function, free_function, NULL, NULL };
-ClassObject G_class_code_class = { &G_class_class, 1, NULL, { NULL, 0, 0 }, 9, mark_class_code, free_class_code, NULL,
-		NULL };
-ClassObject G_method_class = { &G_class_class, 1, NULL, { NULL, 0, 0 }, 7, mark_method, free_method, NULL, NULL };
-
-ClassObject G_builtin_class = { &G_class_class, 1, NULL, { NULL, 0, 0 }, 11, mark_builtin, free_builtin, NULL, NULL };
-
-VectorString G_str_t; /*全局静态字符串表*/
-GlobalInfo G_info;
-
-void gc_mark() {
-	printf("start  mark");
-	int s;
-	for (s = 0; s < G_str_t.n; s++) {
-		StringObject *v = G_str_t.data[s];
-		v->mark = 1;
-	}
-	G_info.top_parser->in_class->mark_obj((MyObject*) G_info.top_parser);
-	Frame frame;
-	int i;
-	for (i = 0; i < G_info.top_frame; i++) {
-		frame = G_info.frames[i];
-		int m;
-		for (m = 0; m < frame.n; m++) {
-			Value v = frame.value[m];
-			if (v.type == OBJECT) {
-				if (v.u.object->mark == 0) {
-					v.u.object->in_class->mark_obj(v.u.object);
-				}
-			}
-		}
-		int n;
-		for (n = 0; n < frame.runtime.n; n++) {
-			Value v = frame.runtime.data[n];
-			if (v.type == OBJECT) {
-				if (v.u.object->mark == 0) {
-					v.u.object->in_class->mark_obj(v.u.object);
-				}
-			}
-		}
-	}
-}
-
-void gc_sweep() {
-	printf("start sweep");
-	MyObject *prev, *tmp, *curr;
-	prev = curr = G_info.gc_head;
-	if (curr != NULL) {
-		if (curr->mark == 1) {
-			curr->mark = 0;
-			curr = curr->next;
-		} else {
-			tmp = curr;
-			curr->in_class->free_obj(curr);
-			curr = tmp->next;
-			free(tmp);
-		}
-	}
-	while (curr != NULL) {
-		if (curr->mark == 1) {
-			prev = curr;
-			curr->mark = 0;
-			curr = curr->next;
-		} else {
-			tmp = curr;
-			curr->in_class->free_obj(curr);
-			curr = tmp->next;
-			prev->next = curr;
-			free(tmp);
-		}
-	}
-}
-
-void gc_start() {
-	printf("start gc ,count is  %d,capacity is %d", G_info.gc_count, G_info.gc_capacity);
-	gc_mark();
-	gc_sweep();
-}
-
-MyObject* gc_malloc(int size) {
-	if (G_info.gc_count >= G_info.gc_capacity) {
-		G_info.gc_capacity = G_info.gc_capacity * 2;
-		gc_start();
-	}
-	MyObject *p = (MyObject*) malloc(size);
-	if (p == NULL) {
-		gc_start();
-		p = (MyObject*) malloc(size);
-		if (p == NULL) {
-			printf("not enough memory");
-			exit(0);
-		}
-	}
-	G_info.gc_count++;
-	p->mark = 0;
-	p->next = G_info.gc_head;
-	G_info.gc_head = p;
-	return p;
-}
-
-void mark_vector_fields(VectorField v) {
-	int i = 0;
-	for (i = 0; i < v.n; i++) {
-		if (v.data[i].value.type == OBJECT) {
-			MyObject *obj = v.data[i].value.u.object;
-			obj->in_class->mark_obj(obj);
-		}
-	}
-}
-
-void mark_string(MyObject *obj) {
-	((StringObject*) obj)->mark = 1;
-}
-
-void free_string(MyObject *obj) {
-	StringObject *s = (StringObject*) obj;
-	if (s->is_const == -1) {
-		free(s->str_char);
-	}
-}
-
-StringObject* init_string_object(char *str_char, int pos) {
-	StringObject *s = (StringObject*) gc_malloc(sizeof(StringObject));
-	s->in_class = &G_string_class;
-	int len = strlen(str_char);
-	s->str_char = str_char;
-	s->len = len;
-	s->is_const = pos;
-	return s;
-}
-
-int get_const_string(char *name) {
-	int i;
-	for (i = G_str_t.n - 1; i >= 0; i--) {
-		StringObject *v = G_str_t.data[i];
-		if (strcmp(v->str_char, name) == 0) {
-			return i;
-		}
-	}
-	return -1;
-}
-int save_const_string(char *name) {
-	int pos = get_const_string(name);
-	if (pos != -1) {
-		return pos;
-	}
-	StringObject *s_o = init_string_object(strdup(name), G_str_t.n);
-	vector_push(&G_str_t, StringObject*, s_o);
-	return G_str_t.n - 1;
-}
-
-void mark_vector_value(VectorValue v) {
-	int i = 0;
-	for (i = 0; i < v.n; i++) {
-		if (v.data[i].type == OBJECT) {
-			MyObject *obj = v.data[i].u.object;
-			obj->in_class->mark_obj(obj);
-		}
-	}
-}
-void mark_list(MyObject *obj) {
-	((ListObject*) obj)->mark = 1;
-	mark_vector_value(((ListObject*) obj)->list);
-}
-
-void free_list(MyObject *obj) {
-	ListObject *l_obj = (ListObject*) obj;
-	free(l_obj->list.data);
-}
-
-ListObject* init_list_object(int size) {
-	ListObject *obj = (ListObject*) gc_malloc(sizeof(ListObject));
-	obj->in_class = &G_list_class;
-	vector_init(&obj->list, Value, size);
-	return obj;
-}
-
-void mark_map(MyObject *obj) {
-	MapObject *m_obj = (MapObject*) obj;
-	m_obj->mark = 1;
-	int i;
-	for (i = 0; i < m_obj->capacity; i++) {
-		HashNode *tmp;
-		for (tmp = m_obj->hash_table[i]; tmp != NULL; tmp = tmp->next) {
-			if (tmp->v.type == OBJECT) {
-				MyObject *obj = tmp->v.u.object;
-				obj->in_class->mark_obj(obj);
-			}
-			tmp->string->in_class->mark_obj((MyObject*) tmp->string);
-		}
-	}
-}
-void free_map(MyObject *obj) {
-	MapObject *m_obj = (MapObject*) obj;
-	int i;
-	for (i = 0; i < m_obj->capacity; i++) {
-		HashNode *head = m_obj->hash_table[i];
-		HashNode *tmp;
-		while (head != NULL) {
-			tmp = head;
-			head = tmp->next;
-			free(tmp);
-		}
-	}
-	free(m_obj->hash_table);
-}
-
-MapObject* init_map_object(int size) {
-	MapObject *o = (MapObject*) gc_malloc(sizeof(MapObject));
-	o->in_class = &G_map_class; /*后续加上这个列表对应的类类型*/
-	o->capacity = size;
-	o->hash_table = (HashNode**) malloc(sizeof(HashNode*) * size);
-	int i;
-	for (i = 0; i < size; i++) {
-		o->hash_table[i] = NULL;
-	}
-	return o;
-}
-
-HashNode* init_hash_node(StringObject *str, Value v, int hash_value, HashNode *next) {
-	HashNode *h = (HashNode*) malloc(sizeof(HashNode));
-	h->hash_value = hash_value;
-	h->string = str;
-	h->v = v;
-	h->next = next;
-	return h;
-}
-
-int util_key2index(char *key, int b) {
-	int sum = 0;
-	int i;
-	for (i = 0; i < strlen(key); i++) {
-		sum = sum + (int) key[i];
-	}
-	return sum % b;
-}
-
-HashNode* get_hash_node(HashNode **table, StringObject *str, int hash_value) {
-	HashNode *tmp;
-	for (tmp = table[hash_value]; tmp != NULL; tmp = tmp->next) {
-		if (tmp->string->len == str->len && strcmp(tmp->string->str_char, str->str_char) == 0) {
-			return tmp;
-		}
-	}
-	return NULL;
-}
-
-HashNode* save_hash_node(HashNode **table, Value v, StringObject *str, int hash_value) {
-	HashNode *node = get_hash_node(table, str, hash_value);
-	if (node != NULL) {
-		return node;
-	}
-	table[hash_value] = init_hash_node(str, v, hash_value, table[hash_value]);
-	return table[hash_value];
-}
-
-void mark_class(MyObject *obj) {
-	ClassObject *c_obj = ((ClassObject*) obj);
-	c_obj->mark = 1;
-	mark_vector_fields(c_obj->fields);
-	c_obj->super->mark_obj((MyObject*) c_obj->in_class);
-}
-
-void free_class(MyObject *obj) {
-	ClassObject *c_obj = ((ClassObject*) obj);
-	free(c_obj->fields.data);
-}
-
-void mark_instance(MyObject *obj) {
-	InstanceObject *i_obj = ((InstanceObject*) obj);
-	i_obj->mark = 1;
-	mark_vector_fields(i_obj->fields);
-	i_obj->in_class->mark_obj((MyObject*) i_obj->in_class);
-}
-
-void free_instance(MyObject *obj) {
-	ClassObject *i_obj = ((ClassObject*) obj);
-	free(i_obj->fields.data);
-}
-
-InstanceObject* init_instance_object(ClassObject *in_class) {
-	InstanceObject *c_o = (InstanceObject*) gc_malloc(sizeof(InstanceObject));
-	vector_new(&c_o->fields, Field);
-	c_o->in_class = in_class;
-	return c_o;
-}
-
-ClassObject* init_class_object(ClassCodeObject *code, StringPos name) {
-	ClassObject *c_o = (ClassObject*) gc_malloc(sizeof(ClassObject));
-	c_o->in_class = &G_class_class;
-	vector_new(&c_o->fields, Field);
-	c_o->name = name;
-	c_o->mark_obj = mark_instance;
-	c_o->free_obj = free_instance;
-	c_o->code = code;
-	c_o->super = NULL;
-	return c_o;
-}
-
-void mark_module(MyObject *obj) {
-	ModuleObject *m_obj = ((ModuleObject*) obj);
-	m_obj->mark = 1;
-	mark_vector_value(m_obj->value);
-}
-
-void free_module(MyObject *obj) {
-	ModuleObject *m_obj = ((ModuleObject*) obj);
-	free(m_obj->in_code.data);
-	free(m_obj->value.data);
-	free(m_obj->var.data);
-	free(m_obj->else_e.data);
-	free(m_obj->break_e.data);
-	free(m_obj->for_e.data);
-}
-
-ModuleObject* init_module_object(StringPos name_pos) {
-	ModuleObject *o = (ModuleObject*) gc_malloc(sizeof(ModuleObject));
-	o->in_class = &G_module_class;
-	vector_new(&o->in_code, Instruction);
-	vector_new(&o->value, Value);
-	vector_new(&o->var, Var);
-	o->top = o;
-	o->name = name_pos;
-	vector_new(&o->else_e, int);
-	vector_new(&o->break_e, int);
-	vector_new(&o->for_e, Instruction);
-	return o;
-}
-
-void mark_function(MyObject *obj) {
-	FunctionObject *f_obj = ((FunctionObject*) obj);
-	f_obj->mark = 1;
-	mark_vector_value(f_obj->value);
-}
-
-void free_function(MyObject *obj) {
-	FunctionObject *f_obj = ((FunctionObject*) obj);
-	free(f_obj->in_code.data);
-	free(f_obj->value.data);
-	free(f_obj->var.data);
-}
-
-FunctionObject* init_function_object(ModuleObject *top, StringPos name, MyParserObject *prev) {
-	FunctionObject *o = (FunctionObject*) gc_malloc(sizeof(FunctionObject));
-	o->in_class = &G_function_class;
-	vector_new(&o->in_code, Instruction);
-	vector_new(&o->value, Value);
-	vector_new(&o->var, Var);
-	o->name = name;
-	o->top = top;
-	o->prev = prev;
-	o->args_num = 0;
-	return o;
-}
-
-void mark_class_code(MyObject *obj) {
-	ClassCodeObject *c_obj = ((ClassCodeObject*) obj);
-	c_obj->mark = 1;
-	mark_vector_value(c_obj->value);
-}
-
-void free_class_code(MyObject *obj) {
-	ClassCodeObject *c_obj = ((ClassCodeObject*) obj);
-	free(c_obj->in_code.data);
-	free(c_obj->value.data);
-	free(c_obj->var.data);
-}
-
-ClassCodeObject* init_class_code_object(ModuleObject *top, StringPos name) {
-	ClassCodeObject *o = (ClassCodeObject*) gc_malloc(sizeof(ClassCodeObject));
-	o->in_class = &G_class_code_class;
-	vector_new(&o->in_code, Instruction);
-	vector_new(&o->value, Value);
-	vector_new(&o->var, Var);
-	o->name = name;
-	o->super_pos = -1;
-	o->top = top;
-	return o;
-}
-
-void mark_method(MyObject *obj) {
-	MethodObject *m_obj = ((MethodObject*) obj);
-	m_obj->mark = 1;
-	m_obj->func->in_class->mark_obj((MyObject*) m_obj->func);
-}
-
-void free_method(MyObject *obj) {
-	NULL;/*do nothing */
-}
-
-MethodObject* init_method_object(FunctionObject *func, InstanceObject *inst) {
-	MethodObject *o = (MethodObject*) gc_malloc(sizeof(MethodObject));
-	o->in_class = &G_method_class;
-	o->func = func;
-	o->inst = inst;
-	return o;
-}
-
-void mark_builtin(MyObject *obj) {
-	BuiltinObject *b_obj = ((BuiltinObject*) obj);
-	b_obj->mark = 1;
-}
-
-void free_builtin(MyObject *obj) {
-	NULL;
-}
-
-ClassObject* value2class(Value v) {
-	assert(v.type == OBJECT && v.u.object->in_class == &G_class_class);
-	return (ClassObject*) v.u.object;
-}
-
-ClassCodeObject* value2class_code(Value v) {
-	assert(v.type == OBJECT && v.u.object->in_class == &G_class_code_class);
-	return (ClassCodeObject*) v.u.object;
-}
-
-Value obj2value(void *object) {
-	Value v;
-	v.type = OBJECT;
-	v.u.object = (MyObject*) object;
-	return v;
-}
-Value int2value(int i) {
-	Value v;
-	v.type = INTEGER;
-	v.u.integer = i;
-	return v;
-}
-
-FunctionObject* value2func(Value v) {
-	assert(v.type == OBJECT && v.u.object->in_class == &G_function_class);
-	return (FunctionObject*) v.u.object;
-}
-ListObject* value2list(Value v) {
-	assert(v.type == OBJECT && v.u.object->in_class == &G_list_class);
-	return (ListObject*) v.u.object;
-}
-int value2int(Value v) {
-	assert(v.type == INTEGER);
-	return v.u.integer;
-}
-
-InstanceObject* value2instance(Value v) {
-	assert(v.type == OBJECT && v.u.object->in_class->code != NULL);/*用code不等于空判断是否有问题*/
-	return (InstanceObject*) v.u.object;
-}
-StringObject* value2string(Value v) {
-	assert(v.type == OBJECT && v.u.object->in_class == &G_string_class);
-	return (StringObject*) v.u.object;
-}
-
-void save_frame(Frame frame) {
-	if (G_info.top_frame >= FRAME_DEPTH) {
-		printf("stack over max depth");
-		exit(0);
-	}
-	G_info.frames[G_info.top_frame] = frame;
-	G_info.top_frame++;
-}
-
-Frame* top_frame() {
-	assert(!(G_info.top_frame == 0));
-	return &(G_info.frames[G_info.top_frame - 1]);
-}
-
-Frame* pop_frame() {
-	assert(!(G_info.top_frame == 0));
-	G_info.top_frame--;
-	return &(G_info.frames[G_info.top_frame]);
-}
-
-Frame* buttom_frame() {
-	assert(!(G_info.top_frame == 0));
-	return &(G_info.frames[0]);
-}
-
-void parser_expr_main(MyParserObject *p, Lexer *l);
-int parser_expr_list(MyParserObject *p, Lexer *l);
-void parser_state_list(MyParserObject *p, Lexer *l);
-void parser_state(MyParserObject *p, Lexer *l);
-void parser_expr_map(MyParserObject *p, Lexer *l);
-void parser_expr_array(MyParserObject *p, Lexer *l);
-int parser_func_body(MyParserObject *p, Lexer *l);
-ClassCodeObject* init_class_code_object(ModuleObject *top, StringPos name);
-int get_loc_var(MyParserObject *p, StringPos name);
-Value vm(MyParserObject *p);
-
-void eat_token(Lexer *lex, int token_enum) {
-	lex->type = token_enum;
-	lex->curr_char = lex->content[++lex->pos];
-}
-void eat_token2(Lexer *lex, int token_enum) {
-	lex->type = token_enum;
-	lex->pos++;
-	lex->curr_char = lex->content[++lex->pos];
-}
-
-void lexer_number(Lexer *lex) {
-	for (; isdigit(lex->curr_char); next_char(lex)) {
-		save_char(lex, lex->curr_char);
-	}
-	if (lex->curr_char == '.') {
-		save_char(lex, lex->curr_char);
-		next_char(lex);
-		if (!isdigit(lex->curr_char)) {
-			printf("token error");
-			exit(1);
-		};
-		for (; isdigit(lex->curr_char); next_char(lex)) {
-			save_char(lex, lex->curr_char);
-		}
-		save_char(lex, '\0');
-		lex->type = TOKEN_NUMBER;
-		lex->u.number = atof(lex->buff.data);
-	} else {
-		save_char(lex, '\0');
-		lex->type = TOKEN_INTEGER;
-		lex->u.integer = atoi(lex->buff.data);
-	}
-}
-
-void lexer_string(Lexer *lex) {
-	next_char(lex);
-	for (; lex->curr_char != '"'; next_char(lex)) {
-		save_char(lex, lex->curr_char);
-	}
-	save_char(lex, '\0');
-	next_char(lex);
-	int pos = save_const_string(lex->buff.data);
-	lex->u.str_pos = pos;
-	lex->type = TOKEN_STRING;
-}
-
-void lexer_identifier(Lexer *lex) {
-	if (isalpha(lex->curr_char) || lex->curr_char == '_') {
-		save_char(lex, lex->curr_char);
-		next_char(lex);
-	}
-	for (; isalpha(lex->curr_char) || lex->curr_char == '_' || isdigit(lex->curr_char); next_char(lex)) {
-		save_char(lex, lex->curr_char);
-	}
-	save_char(lex, '\0');
-	int i;
-	for (i = 0; i < NUM_RESERVED; i++) {
-		if (strcmp(lex->buff.data, reserve[i]) == 0) {
-			lex->type = i + 257;
-			return;
-		}
-	}
-	int pos = save_const_string(lex->buff.data);
-	lex->u.str_pos = pos;
-	lex->type = TOKEN_IDENTIFIER;
-}
-
-void next_token(Lexer *lex) {
-	lex->type = TOKEN_EOF;
-	lex->buff.n = 0;
-	while (1) {
-		switch (lex->curr_char) {
-		case '\n': {
-			next_char(lex);
-			lex->curr_line++;
-			lex->type = TOKEN_NEWLINE;
-			break;
-		}
-		case ' ':
-		case '\t':
-		case '\v':
-			next_char(lex);
-			break;
-		case '|': {
-			if (look_char(lex)== '|') {
-				eat_token2(lex, TOKEN_OR);
-				return;
-			} else {
-				eat_token(lex, '|');
-				return;
-			}
-		}
-		case '&': {
-			if (look_char(lex) == '&') {
-				eat_token2(lex, TOKEN_AND);
-				return;
-			} else {
-				eat_token(lex, '&');
-				return;
-			}
-		}
-		case '<': {
-			if (look_char(lex) == '=') {
-				eat_token2(lex, TOKEN_LT_EQ);
-				return;
-			} else {
-				eat_token(lex, '<');
-				return;
-			}
-		}
-		case '>': {
-			if (look_char(lex) == '=') {
-				eat_token2(lex, TOKEN_GT_EQ);
-				return;
-			} else {
-				eat_token(lex, '>');
-				return;
-			}
-		}
-		case '=': {
-			if (look_char(lex) == '=') {
-				eat_token2(lex, TOKEN_EQ);
-				return;
-			} else {
-				eat_token(lex, '=');
-				return;
-			}
-		}
-		case '!': {
-			if (look_char(lex) == '=') {
-				eat_token2(lex, TOKEN_NOT_EQ);
-				return;
-			} else {
-				eat_token(lex, '!');
-				return;
-			}
-		}
-		case '\0': {
-			eat_token(lex, TOKEN_EOF);
-			return;
-		}
-		case '"': {
-			lexer_string(lex);
-			return;
-		}
-		default: {
-			if (isdigit(lex->curr_char)) {
-				lexer_number(lex);
-			} else if (isalpha(lex->curr_char) || lex->curr_char == '_') {
-				lexer_identifier(lex);
-			} else {
-				eat_token(lex, lex->curr_char);
-			}
-			return;
-		}
-	};
-}
-}
-
-void check_token(Lexer *l, int c) {
-	if (l->type != c) {
-		printf("type is an error has occur ");
-		exit(1);
-	}
-}
-
-void check_skip(Lexer *l, int c) {
-	check_token(l, c);
-	next_token(l);
-}
-
-int get_global_var(MyParserObject *p, StringPos name) {
-	int r = -1;
-	if (p->in_class == &G_module_class) {
-		return r;
-	}
-	r = get_loc_var((MyParserObject*) p->top, name);
-	return r;
-}
-
-int get_loc_var(MyParserObject *p, StringPos name) {
-	int i;
-	for (i = p->var.n - 1; i >= 0; i--) {
-		Var v = p->var.data[i];
-		if (v == name) {
-			return i;
-		}
-	}
-	return -1;
-}
-
-int save_loc_var(MyParserObject *p, StringPos name) {
-	vector_push(&p->var, Var, name);
-	return p->var.n - 1;
-}
-
-void save_incode(MyParserObject *p, OpKind op, int v) {
-	Instruction in_code;
-	in_code.op = op;
-	in_code.v = v;
-	vector_push(&p->in_code, Instruction, in_code);
-}
-
-void parser_load_var(MyParserObject *p, StringPos name) {
-	int i = get_loc_var(p, name);
-	if (i != -1) {
-		save_incode(p, OP_LOAD, i);
-		return;
-	}
-	i = get_global_var(p, name);
-	if (i != -1) {
-		save_incode(p, OP_LOAD_GLOBAL, i);
-		return;
-	}
-	if (i == -1) {
-		printf("can not find variable");
-		exit(0);
-	}
-}
-
-int parser_expr_funcall(MyParserObject *p, Lexer *l) {
-	int n;
-	check_skip(l, '(');
-	if (l->type == ')') {
-		n = 0;
-	} else {
-		n = parser_expr_list(p, l);
-	}
-	check_skip(l, ')');
-	return n;
-}
-
-/*parser_expr_complex -> this |NAME |  '(' expr_mian')' {'.' NAME |'.' NAME '('[exp_list]')' | '[' binexpr ']' |  '('[exp_list]')' } */
-/*此处如果有多余的字符会出现bug*/
-ExprTempType parser_expr_complex(MyParserObject *p, Lexer *l) {
-	ExprTempType e;
-	e.flag = 0;
-	e.str_pos = 0;
-	if (l->type == TOKEN_IDENTIFIER) {
-		e.flag = 1; /*说明是标识符*/
-		e.str_pos = l->u.str_pos;
-		next_token(l);
-		if (l->type == '=') {
-			return e;
-		}
-		parser_load_var(p, e.str_pos);
-	} else if (l->type == '(') {
-		next_token(l);
-		parser_expr_main(p, l);
-		check_skip(l, ')');
-	} else if (l->type == TOKEN_THIS) {
-		next_token(l);
-		save_incode(p, OP_THIS, -1);
-	} else if (l->type == TOKEN_SUPER) {
-		next_token(l);
-		save_incode(p, OP_SUPER, -1);
-	}
-	while (l->type == '.' || l->type == '[' || l->type == '(') {
-		if (l->type == '.') {
-			e.flag = 2;/*说明是成员变量*/
-			next_token(l);
-			check_token(l, TOKEN_IDENTIFIER);
-			e.str_pos = l->u.str_pos;
-			next_token(l);
-			if (l->type == '=') {
-				return e;
-			}
-			save_incode(p, OP_LOAD_ATTR, e.str_pos); /*这里直接从全局字符串中取字符串的位置，后续用字符串动态查找*/
-		} else if (l->type == '[') {
-			e.flag = 3; /*说明是索引*/
-			next_token(l);
-			parser_expr_main(p, l);
-			check_skip(l, ']');
-			if (l->type == '=') {
-				return e;
-			}
-			save_incode(p, OP_INDEX, 0);
-		} else {
-			if (e.flag == 0) {
-				printf("function call failed");
-				exit(0);
-			}
-			save_incode(p, OP_FUNC_CALL, parser_expr_funcall(p, l));
-		}
-	}
-	return e;
-}
-
-/*simpleexp ::= null  |  false  |  true  |  Number  |  String | map |  array  |  suffixedexp    | function func_body */
-void parser_expr_base(MyParserObject *p, Lexer *l) {
-	switch (l->type) {
-	case TOKEN_NULL: {
-		save_incode(p, OP_CONST_NULL, 0);
-		next_token(l);
-		break;
-	}
-	case TOKEN_TRUE: {
-		save_incode(p, OP_CONST_TRUE, 0);
-		next_token(l);
-		break;
-	}
-	case TOKEN_FALSE: {
-		save_incode(p, OP_CONST_FALSE, 0);
-		next_token(l);
-		break;
-	}
-	case TOKEN_NUMBER: {
-		save_incode(p, OP_PUSH, p->value.n);
-		Value v;
-		v.type = NUMBER;
-		v.u.number = l->u.number;
-		save_value(p, v);
-		next_token(l);
-		break;
-	}
-	case TOKEN_INTEGER: {
-		save_incode(p, OP_CONST_INT, l->u.integer);
-		next_token(l);
-		break;
-	}
-	case TOKEN_STRING: {
-		save_incode(p, OP_PUSH, p->value.n);
-		Value v = obj2value(G_str_t.data[l->u.str_pos]);/*从全局字符串表中获取字符串对象*/
-		save_value(p, v);
-		next_token(l);
-		break;
-	}
-	case '[': {
-		parser_expr_array(p, l);
-		break;
-	}
-	case '{': {
-		parser_expr_map(p, l);
-		break;
-	}
-	case TOKEN_FUNCTION: {
-		next_token(l);
-		FunctionObject *f_o = init_function_object(p->top, 0, p); /*这里名字NULL可以改成-1*/
-		if (p->in_class == &G_class_code_class) {
-			save_loc_var((MyParserObject*) f_o, 2);/*类方法第一变量是this*/
-		}
-		int args_num = parser_func_body((MyParserObject*) f_o, l);
-		f_o->args_num = args_num;
-		save_incode(p, OP_PUSH, p->value.n);
-		Value v = obj2value(f_o);
-		save_value(p, v);
-		break;
-	}
-	default: {
-		parser_expr_complex(p, l);
-	}
-	}
-}
-
-/*prefixexp -> [simpleexp | unop prefixexp] */
-void parser_expr_prefix(MyParserObject *p, Lexer *l) {
-	if (l->type == '!' || l->type == '-') {
-		int op = l->type;
-		next_token(l);
-		parser_expr_prefix(p, l);
-		if (op == '!') {
-			save_incode(p, OP_NOT, 0);
-		} else if (op == '-') {
-			save_incode(p, OP_MINUS, 0);
-		}
-	} else {
-		parser_expr_base(p, l);
-	}
-}
-
-/*binexpr ->   prefixexp { binop prefixexp} */
-void parser_mul_div(MyParserObject *p, Lexer *l) {
-	parser_expr_prefix(p, l);
-	while (l->type == '*' || l->type == '/') {
-		int op = l->type;
-		next_token(l);
-		if (op == '*') {
-			parser_expr_prefix(p, l);
-			save_incode(p, OP_MUL, 0);
-		} else {
-			parser_expr_prefix(p, l);
-			save_incode(p, OP_DIV, 0);
-		}
-	}
-}
-
-void parser_plus_minus(MyParserObject *p, Lexer *l) {
-	parser_mul_div(p, l);
-	while (l->type == '+' || l->type == '-') {
-		int op = l->type;
-		next_token(l);
-		if (op == '+') {
-			parser_mul_div(p, l);
-			save_incode(p, OP_PLUS, 0);
-		} else {
-			parser_mul_div(p, l);
-			save_incode(p, OP_SUB, 0);
-		}
-	}
-}
-void parser_boolean(MyParserObject *p, Lexer *l) {
-	parser_plus_minus(p, l);
-	while (l->type == '>' || l->type == '<' || l->type == TOKEN_LT_EQ || l->type == TOKEN_GT_EQ) {
-		int op = l->type;
-		next_token(l);
-		if (op == '>') {
-			parser_plus_minus(p, l);
-			save_incode(p, OP_GT, 0);
-		} else if (op == '<') {
-			parser_plus_minus(p, l);
-			save_incode(p, OP_LT, 0);
-		} else if (op == TOKEN_LT_EQ) {
-			parser_plus_minus(p, l);
-			save_incode(p, OP_LT_EQ, 0);
-		} else {
-			parser_plus_minus(p, l);
-			save_incode(p, OP_GT_EQ, 0);
-		}
-	}
-}
-
-void parser_equal(MyParserObject *p, Lexer *l) {
-	parser_boolean(p, l);
-	while (l->type == TOKEN_EQ || l->type == TOKEN_NOT_EQ) {
-		int op = l->type;
-		next_token(l);
-		if (op == TOKEN_EQ) {
-			parser_boolean(p, l);
-			save_incode(p, OP_EQ, 0);
-		} else {
-			parser_boolean(p, l);
-			save_incode(p, OP_NOT_EQ, 0);
-		}
-	}
-}
-
-void parser_logical_and(MyParserObject *p, Lexer *l) {
-	parser_equal(p, l);
-	while (l->type == TOKEN_AND) {
-		next_token(l);
-		parser_equal(p, l);
-		save_incode(p, OP_AND, 0);
-	};
-}
-
-void parser_expr_main(MyParserObject *p, Lexer *l) {
-	parser_logical_and(p, l);
-	while (l->type == TOKEN_OR) {
-		next_token(l);
-		parser_logical_and(p, l);
-		save_incode(p, OP_OR, 0);
-	};
-}
-
-/*map -> '{' [ Name ':' exp {',' Name ':' exp} ] '}'*/
-void parser_expr_map(MyParserObject *p, Lexer *l) {
-	check_skip(l, '{');
-	int n = 0;
-	while (l->type == TOKEN_IDENTIFIER || l->type == TOKEN_STRING) {
-		save_incode(p, OP_PUSH, p->value.n);
-		Value v = obj2value(G_str_t.data[l->u.str_pos]);/*从全局字符串表中获取字符串对象*/
-		save_value(p, v);
-		next_token(l);
-		if (l->type == ':') {
-			next_token(l);
-			parser_expr_main(p, l);
-		} else {
-			printf("map parser error");
-			exit(0);
-		}
-		n++;
-		if (l->type == ',') {
-			next_token(l);
-		} else if (l->type == '}') {
-			break;
-		} else {
-			printf("map parser error  ,");
-			exit(0);
-		}
-	}
-	check_skip(l, '}');
-	save_incode(p, OP_BUILD_MAP, n); /*这里一个key-value的值在函数运行栈中写了两次，在创建这里n应乘2*/
-}
-
-/*array -> '[' [exp_list] ']'*/
-void parser_expr_array(MyParserObject *p, Lexer *l) {
-	int n;
-	check_skip(l, '[');
-	if (l->type == ']') {
-		n = 0;
-	} else {
-		n = parser_expr_list(p, l);
-	}
-	save_incode(p, OP_BUILD_LIST, n);
-	check_skip(l, ']');
-}
-
-/*new -> new  NAME '(' exp_list ')'*/
-void parser_expr_new(MyParserObject *p, Lexer *l) {
-	int index = get_loc_var((MyParserObject*) p->top, l->u.str_pos);
-	if (index == -1) {
-		printf("new error");
-		exit(0);
-	}
-	save_incode(p, OP_LOAD, index);
-	next_token(l);
-	int n;
-	check_skip(l, '(');
-	if (l->type == ')') {
-		n = 0;
-	} else {
-		n = parser_expr_list(p, l);
-	}
-	check_skip(l, ')');
-	save_incode(p, OP_BUILD_OBJECT, n);
-}
-
-/*parser_expr_assignment -> suffixexp | assignment*/
-/*assignment ::= suffixedexp = binexpr|  new */
-void parser_expr_assignment(MyParserObject *p, Lexer *l) {
-	ExprTempType e = parser_expr_complex(p, l);
-	if (l->type != '=') {
-		return;
-	}
-	next_token(l);
-	if (l->type == TOKEN_NEW) {
-		next_token(l);
-		parser_expr_new(p, l);
-	} else {
-		parser_expr_main(p, l);
-	}
-	switch (e.flag) {
-	case 1: {
-		int i = get_loc_var(p, e.str_pos);
-		if (i == -1) {
-			i = save_loc_var(p, e.str_pos);
-		}
-		save_incode(p, OP_STORE, i);
-		break;
-	}
-	case 2: {
-		save_incode(p, OP_STORE_ATTR, e.str_pos);
-		break;
-	}
-	case 3: {
-		save_incode(p, OP_STORE_INDEX, e.str_pos);
-		break;
-	}
-	default: {
-		printf(" assignment error  ");
-		exit(1);
-	}
-	}
-}
-
-/*parser_expr_list ->  exp {',' exp } */
-int parser_expr_list(MyParserObject *p, Lexer *l) {
-	int n = 1;
-	parser_expr_main(p, l);
-	while (l->type == ',') {
-		next_token(l);
-		parser_expr_main(p, l);
-		n++;
-	}
-	return n;
-}
-
-/* block -> '{'state_list'}' */
-void parser_block(MyParserObject *p, Lexer *l) {
-	check_skip(l, '{');
-	parser_state_list(p, l);
-	check_skip(l, '}');
-}
-
-/*parser_while ->  while '(' exp ')' block*/
-void parser_while(MyParserObject *p, Lexer *l) {
-	check_skip(l, '(');
-	vector_push(&p->top->break_e, int, -1);
-	int mark0 = p->in_code.n;
-	parser_expr_main(p, l);
-	int mark1 = p->in_code.n;
-	save_incode(p, OP_GOTO_IF_FALSE, 0);
-	check_skip(l, ')');
-	parser_block(p, l);
-	save_incode(p, OP_GOTO, mark0);
-	(p->in_code.data[mark1]).v = p->in_code.n;
-	int mark2 = vector_pop(&p->top->break_e);
-	if (mark2 != -1) {
-		(p->in_code.data[mark2]).v = p->in_code.n;
-	}
-}
-
-void parser_for_sub(MyParserObject *p, Lexer *l) {
-	int mark0 = p->in_code.n;
-	int mark1 = -1;
-	int mark2 = -1;
-	int num = -1;
-	if (l->type == ';') {
-		next_token(l);
-	} else {
-		parser_expr_main(p, l);
-		mark1 = p->in_code.n;
-		save_incode(p, OP_GOTO_IF_FALSE, 0);
-		check_skip(l, ';');
-	}
-	if (l->type == ')') {
-		next_token(l);
-	} else {
-		int top = p->in_code.n;
-		mark2 = p->top->for_e.n;
-		parser_expr_assignment(p, l);
-		while (l->type == ',') {
-			next_token(l);
-			parser_expr_assignment(p, l);
-		}
-		num = p->in_code.n - top;
-		int i;
-		for (i = 0; i < num; i++) {
-			vector_push(&p->top->for_e, Instruction, (p->in_code.data)[top + i]);
-		}
-		p->in_code.n = top;
-		check_skip(l, ')');
-	}
-	parser_block(p, l);
-	if (mark2 != -1) {
-		int i;
-		for (i = 0; i < num; i++) {
-			vector_push(&p->in_code, Instruction, (p->top->for_e.data)[mark2 + i]);
-		}
-		p->top->for_e.n = mark2;
-	}
-	save_incode(p, OP_GOTO, mark0);
-	if (mark1 != -1) {
-		(p->in_code.data[mark1]).v = p->in_code.n;
-	}
-
-}
-
-/*parser_for ->  for '(' [Name '=' exp ]';' [exp] ';'[exp {',' exp}] ')' block*/
-/*parser_for ->  for '(' Name of exp ')'  block */
-void parser_for(MyParserObject *p, Lexer *l) {
-	assert(p->in_class != &G_class_code_class);
-	check_skip(l, '(');
-	vector_push(&p->top->break_e, int, -1);
-	if (l->type == TOKEN_IDENTIFIER) {
-		StringPos name = l->u.str_pos;
-		next_token(l);
-		if (l->type == TOKEN_OF) { /*parser_for_of */
-			next_token(l);
-			parser_expr_main(p, l);
-			check_skip(l, ')');
-			int var = save_loc_var(p, name);
-			int array_point = save_loc_var(p, 0);
-			save_incode(p, OP_STORE, array_point);
-			save_incode(p, OP_LOAD, array_point);
-			save_incode(p, OP_ARRAY_LENGTH, 0);
-			int array_length = save_loc_var(p, 0);
-			save_incode(p, OP_STORE, array_length);
-			save_incode(p, OP_CONST_INT, 0);
-			int counter = save_loc_var(p, 0);
-			save_incode(p, OP_STORE, counter);
-			int mark0 = p->in_code.n;
-			save_incode(p, OP_LOAD, counter);
-			save_incode(p, OP_LOAD, array_length);
-			save_incode(p, OP_LT, 0);
-			int mark1 = p->in_code.n;
-			save_incode(p, OP_GOTO_IF_FALSE, 0);
-			save_incode(p, OP_LOAD, array_point);
-			save_incode(p, OP_LOAD, counter);
-			save_incode(p, OP_INDEX, 0);
-			save_incode(p, OP_STORE, var);
-			parser_block(p, l);
-			save_incode(p, OP_PLUS_SELF, counter);
-			save_incode(p, OP_GOTO, mark0);
-			(p->in_code.data[mark1]).v = p->in_code.n;
-		} else if (l->type == '=') {
-			next_token(l);
-			parser_expr_main(p, l);
-			int var = save_loc_var(p, name);
-			save_incode(p, OP_STORE, var);
-			check_skip(l, ';');
-			parser_for_sub(p, l);
-		} else {
-			printf("type is an error has occur ");
-			exit(1);
-		}
-	} else if (l->type == ';') {
-		next_token(l);
-		parser_for_sub(p, l);
-	} else {
-		printf("type is an error has occur ");
-		exit(1);
-	}
-	int mark = vector_pop(&p->top->break_e);
-	if (mark != -1) {
-		(p->in_code.data[mark]).v = p->in_code.n;
-	}
-}
-
-/*parser_class_state ->  { Name '=' exp [';'|'\n'] | Name func_body [';'|'\n']}*/
-void parser_class_state(MyParserObject *p, Lexer *l) {
-	while (l->type == TOKEN_IDENTIFIER) {
-		StringPos name = l->u.str_pos;
-		int pos = save_loc_var(p, name);
-		next_token(l);
-		if (l->type == '=') {
-			next_token(l);
-			parser_expr_main(p, l);
-			save_incode(p, OP_STORE, pos);
-		} else if (l->type == '(') {
-			FunctionObject *f_o = init_function_object(p->top, name, p);
-			save_loc_var((MyParserObject*) f_o, 2);/*类方法第一变量是this*/
-			int args_num = parser_func_body((MyParserObject*) f_o, l);
-			f_o->args_num = args_num;
-			save_incode(p, OP_PUSH, p->value.n);
-			Value v;
-			v.type = OBJECT;
-			v.u.object = (MyObject*) f_o;
-			save_value(p, v);
-			save_incode(p, OP_STORE, pos);
-		} else {
-			printf("type is an error has occur ");
-			exit(1);
-		}
-		if (l->type == ';') {
-			next_token(l);
-		}
-	}
-}
-/*parser_class ->  class Name [extends Name ] '{' class_state '}'*/
-void parser_class(MyParserObject *p, Lexer *l) {
-	check_token(l, TOKEN_IDENTIFIER);
-	assert(p->in_class == &G_module_class);
-	StringPos name = l->u.str_pos;
-	ClassCodeObject *c_o = init_class_code_object(p->top, name);
-	next_token(l);
-	if (l->type == TOKEN_EXTENDS) {
-		next_token(l);
-		check_token(l, TOKEN_IDENTIFIER);
-		int super_pos = get_loc_var(p, l->u.str_pos);
-		if (super_pos != -1) {
-			c_o->super_pos = super_pos;
-		} else {
-			printf("can not find superclass");
-			exit(0);
-		}
-		next_token(l);
-	}
-	check_skip(l, '{');
-	parser_class_state((MyParserObject*) c_o, l);
-	check_skip(l, '}');
-	save_incode(p, OP_PUSH, p->value.n);
-	Value v;
-	v.type = OBJECT;
-	v.u.object = (MyObject*) c_o;
-	save_value(p, v);
-	save_incode(p, OP_BUILD_CLASS, save_loc_var(p, name));
-}
-
-/*func_body -> '(' [ Name {',' Name} ] ')' block  */
-int parser_func_body(MyParserObject *p, Lexer *l) {
-	int args_num = 0;
-	check_skip(l, '(');
-	if (l->type == TOKEN_IDENTIFIER) {
-		save_loc_var(p, l->u.str_pos);
-		next_token(l);
-		args_num++;
-		while (l->type == ',') {
-			next_token(l);
-			check_token(l, TOKEN_IDENTIFIER);
-			save_loc_var(p, l->u.str_pos);
-			next_token(l);
-			args_num++;
-		}
-	}
-	check_skip(l, ')');
-	parser_block(p, l);
-	Instruction in_code = vector_last(&p->in_code);
-	if (in_code.op != OP_RETURN) {
-		save_incode(p, OP_CONST_NULL, 0);
-		save_incode(p, OP_RETURN, 0);
-	}
-	return args_num;
-}
-/*parser_func ->  function Name func_body */
-void parser_function(MyParserObject *p, Lexer *l) {
-	check_token(l, TOKEN_IDENTIFIER);
-	StringPos name = l->u.str_pos;
-	next_token(l);
-	FunctionObject *f_o = init_function_object(p->top, name, p);
-	int args_num = parser_func_body((MyParserObject*) f_o, l);
-	f_o->args_num = args_num;
-	save_incode(p, OP_PUSH, p->value.n);
-	Value v;
-	v.type = OBJECT;
-	v.u.object = (MyObject*) f_o;
-	save_value(p, v);
-	save_incode(p, OP_STORE, save_loc_var(p, name));
-}
-
-/*parser_if ->  if '(' exp ')' block {else if '(' exp ')' block} [else block]*/
-void parser_if(MyParserObject *p, Lexer *l) {
-	assert(p->in_class != &G_class_code_class);
-	check_skip(l, '(');
-	parser_expr_main(p, l);
-	/*jmpcode0是if表达式执行失败需跳转的执行jmp */
-	int mark0 = p->in_code.n;
-	save_incode(p, OP_GOTO_IF_FALSE, 0);
-	check_skip(l, ')');
-	parser_block(p, l);
-	/*jmpcode1是if表达式语句执行成功后 跳转到最后结束的指令jmp */
-	save_incode(p, OP_GOTO, p->in_code.n);
-	(p->in_code.data[mark0]).v = p->in_code.n;
-	int mark1 = p->in_code.n - 1;
-	int flag = 0; /*else语句是否已经执行，如果执行后续将不在出现else语句*/
-	int top = p->top->else_e.n;
-	while (l->type == TOKEN_ELSE) {
-		next_token(l);
-		if (l->type == '{') {
-			if (flag == 1) {
-				printf("else is error");
-				exit(1);
-			}
-			flag = 1;
-			parser_block(p, l);
-			break;
-		}
-		while (l->type == TOKEN_IF) {
-			if (flag == 1) {
-				printf("else if is error");
-				exit(1);
-			}
-			next_token(l);
-			check_skip(l, '(');
-			parser_expr_main(p, l);
-			/*jmpcode2是else if表达式语句执行失败需 跳转到下一个else if 的指令jmp */
-			save_incode(p, OP_GOTO_IF_FALSE, p->in_code.n);
-			int mark2 = p->in_code.n - 1;
-			check_skip(l, ')');
-			parser_block(p, l);
-			(p->in_code.data[mark2]).v = p->in_code.n + 1;
-			/*jmpcode3是记录了每次else if 执行成功后 需要跳转到结束的jmp指令*/
-			int mark3 = p->in_code.n;
-			/*这里设置else if如果执行结束直接跳到循环结束的位置，列表内存放每次else if结束的jmp的位置*/
-			vector_push(&p->top->else_e, int, p->in_code.n); /*后续考虑不用顺序表保存这个jmp的位置*/
-			save_incode(p, OP_GOTO, mark3);
-			break;
-		}
-	}
-	int i, pos;
-	/*else if 列表循环赋值结束的位置*/
-	for (i = top; i < p->top->else_e.n; i++) {
-		pos = p->top->else_e.data[i];
-		(p->in_code.data[pos]).v = p->in_code.n;
-	}
-	p->top->else_e.n = top;
-	(p->in_code.data[mark1]).v = p->in_code.n;
-}
-void parser_break(MyParserObject *p, Lexer *l) {
-	int mark = p->in_code.n;
-	save_incode(p, OP_GOTO, 0);
-	int top = p->top->break_e.n;
-	if (top == 0) {
-		printf("error break");
-		exit(0);
-	}
-	(p->top->break_e.data)[top - 1] = mark;
-}
-void parser_return(MyParserObject *p, Lexer *l) {
-	if (l->type == ';' || l->type == '}') {
-		save_incode(p, OP_CONST_NULL, 0);
-	} else {
-		parser_expr_main(p, l);
-	}
-	save_incode(p, OP_RETURN, 0);
-}
-
-void parser_state(MyParserObject *p, Lexer *l) {
-	switch (l->type) {
-	case TOKEN_IF: {
-		next_token(l);
-		parser_if(p, l);
-		break;
-	}
-	case TOKEN_WHILE: {
-		next_token(l);
-		parser_while(p, l);
-		break;
-	}
-	case TOKEN_FOR: {
-		next_token(l);
-		parser_for(p, l);
-		break;
-	}
-	case TOKEN_CLASS: {
-		next_token(l);
-		parser_class(p, l);
-		break;
-	}
-	case TOKEN_FUNCTION: {
-		next_token(l);
-		parser_function(p, l);
-		break;
-	}
-	case TOKEN_BREAK: {
-		next_token(l);
-		parser_break(p, l);
-		break;
-	}
-	case TOKEN_RETURN: {
-		next_token(l);
-		parser_return(p, l);
-		break;
-	}
-	default: {
-		parser_expr_assignment(p, l);
-		break;
-	}
-	}
-}
-
-/* state_list -> {state [';'|'\n']} [last_state] */
-void parser_state_list(MyParserObject *p, Lexer *l) {
-	while (l->type != TOKEN_EOF) {
-		parser_state(p, l);
-		if (l->type == ';') {
-			next_token(l);
-		}
-		if (l->type == ')') {
-			printf("error char");
-			exit(0);
-		}
-		if (l->type == '}') {
-			break;
-		}
-	}
-}
-
-/* main -> state_list EOF */
-void parser_main(MyParserObject *p, Lexer *l) {
-	next_token(l);
-	parser_state_list(p, l);
-	check_token(l, TOKEN_EOF);
-}
-
-Frame init_frame(int n) {
-	Frame frame;
-	frame.value = (Value*) malloc(sizeof(Value) * n);
-	frame.n = n;
-	int i;
-	for (i = 0; i < n; i++) {
-		frame.value[i].type = UNDEFINED;
-	}
-	vector_new(&frame.runtime, Value);
-	return frame;
-}
-
-void free_frame(Frame *frame) {
-	free(frame->value);
-	frame->value = NULL;
-	free(frame->runtime.data);
-	frame->runtime.data = NULL;
-}
-
-#define switch_digit_eval(v1,v2,rtn)   \
-case OP_EQ: {                          \
-	v.type = (v1 == v2) ? TRUE : FALSE;\
-	break;                             \
-}                                      \
-case OP_NOT_EQ: {                      \
-	v.type = (v1 == v2) ? FALSE : TRUE;\
-	break;                             \
-}                                      \
-case OP_GT: {                          \
-	v.type = (v1 > v2) ? TRUE : FALSE; \
-	break;                             \
-}                                      \
-case OP_LT: {                          \
-	v.type = (v1 < v2) ? TRUE : FALSE; \
-	break;                             \
-}                                      \
-case OP_LT_EQ: {                       \
-	v.type = (v1 <= v2) ? TRUE : FALSE;\
-	break;                             \
-}                                      \
-case OP_GT_EQ: {                       \
-	v.type = (v1 >= v2) ? TRUE : FALSE;\
-	break;                             \
-}                                      \
-case OP_AND: {                         \
-	rtn = (v1 == 0) ? v1 : v2;         \
-	break;                             \
-}                                      \
-case OP_OR: {                          \
-	rtn = (v1 == 0) ? v2 : v1;         \
-	break;                             \
-}                                      \
-case OP_PLUS: {                        \
-	rtn = v1 + v2;                     \
-	break;                             \
-}                                      \
-case OP_MINUS: {                       \
-	rtn = v1 - v2;                     \
-	break;                             \
-}                                      \
-case OP_MUL: {                         \
-	rtn = v1 * v2;                     \
-	break;                             \
-}
-Value vm_number_eval(double v1, double v2, OpKind op) {
-	Value v;
-	v.type = NUMBER;
-	double rtn = 0;
-	switch (op) {
-	switch_digit_eval(v1, v2, rtn)
-	case OP_DIV: {
-		rtn = v1 / v2;
-		break;
-	}
-	default: {
-		printf("op error");
-		exit(0);
-	}
-	}
-	v.u.number = rtn;
-	return v;
-}
-Value vm_integer_eval(int v1, int v2, OpKind op) {
-	Value v;
-	v.type = INTEGER;
-	int rtn = 0;
-	switch (op) {
-	switch_digit_eval(v1, v2, rtn)
-	case OP_DIV: {
-		double d = v1 / v2;
-		if ((int) d == d) {
-			v.u.integer = (int) d;
-		} else {
-			v.type = NUMBER;
-			v.u.number = d;
-		}
-		return v;
-	}
-	default: {
-		printf("op error");
-		exit(0);
-	}
-	}
-	v.u.integer = rtn;
-	return v;
-}
-Value vm_bool_eval(ValueKind v1, ValueKind v2, OpKind op) {
-	Value v;
-	v.type = FALSE;
-	return v;
-}
-Value vm_string_eval(StringObject *v1, StringObject *v2, OpKind op) {
-	char *v1_string = v1->str_char;
-	char *v2_string = v2->str_char;
-	char *tmp_string = (char*) malloc(strlen(v1_string) + strlen(v2_string) + 1);
-	strcpy(tmp_string, v1_string);
-	strcat(tmp_string, v2_string);
-	StringObject *str = init_string_object(tmp_string, -1);
-	return obj2value(str);
-}
-Value vm_list_eval(ListObject *v1, ListObject *v2, OpKind op) {
-	Value v;
-	/*do something*/
-	return v;
-}
-
-void vm_binop_eval(Frame *frame, Instruction code) {
-	Value v2 = vector_pop(&frame->runtime);
-	Value v1 = vector_pop(&frame->runtime);
-	Value v;
-	switch (v1.type) {
-	case NUMBER: {
-		if (v2.type == NUMBER) {
-			v = vm_number_eval(v1.u.number, v2.u.number, code.op);
-		} else if (v2.type == INTEGER) {
-			v = vm_number_eval(v1.u.number, (double) v2.u.integer, code.op);
-		} else {
-			printf("wrong type,unable calculate");
-			exit(0);
-		}
-		break;
-	}
-	case INTEGER: {
-		if (v2.type == INTEGER) {
-			v = vm_integer_eval(v1.u.integer, v2.u.integer, code.op);
-		} else if (v2.type == NUMBER) {
-			v = vm_number_eval((double) v1.u.integer, v2.u.number, code.op);
-		} else {
-			printf("wrong type,unable calculate");
-			exit(0);
-		}
-		break;
-	}
-	case TRUE:
-	case FALSE: {
-		if (v2.type == TRUE || v2.type == FALSE) {
-			v = vm_bool_eval(v1.type, v2.type, code.op);
-		} else {
-			printf("wrong type,unable calculate");
-			exit(0);
-		}
-		break;
-	}
-	case OBJECT: {
-		if (v1.u.object->in_class == &G_string_class && v2.type == OBJECT && v2.u.object->in_class == &G_string_class) {
-			v = vm_string_eval((StringObject*) v1.u.object, (StringObject*) v2.u.object, code.op);
-		} else if (v1.u.object->in_class == &G_list_class && v2.type == OBJECT
-				&& v2.u.object->in_class == &G_list_class) {
-			v = vm_list_eval((ListObject*) v1.u.object, (ListObject*) v2.u.object, code.op);
-		} else {
-			printf("wrong type,unable calculate");
-			exit(0);
-		}
-		break;
-	}
-	default: {
-		printf("wrong type,unable calculate");
-		exit(0);
-	}
-	}
-	save_runtime_stack(frame, v);
-}
-
-void vm_build_list(Frame *frame, Instruction code) {
-	ListObject *l_o = init_list_object(code.v);
-	int i;
-	for (i = 0; i < code.v; i++) {
-		l_o->list.data[code.v - i - 1] = vector_pop(&frame->runtime);
-	}
-	l_o->list.n = code.v;
-	save_runtime_stack(frame, obj2value(l_o));
-}
-void vm_array_length(Frame *frame) {
-	Value v_list = vector_pop(&frame->runtime);
-	ListObject *l_o = value2list(v_list);
-	save_runtime_stack(frame, int2value(l_o->list.n));
-}
-void vm_index(Frame *frame) {
-	Value v_n = vector_pop(&frame->runtime);
-	Value v_l = vector_pop(&frame->runtime);
-	if (is_map_string(v_l, v_n)) {
-		MapObject *m_o = (MapObject*) v_l.u.object;
-		StringObject *str = (StringObject*) v_n.u.object;
-		int hash_value = util_key2index(str->str_char, m_o->capacity);
-		HashNode *node = get_hash_node(m_o->hash_table, str, hash_value);
-		if (node == NULL) {
-			printf("can not find map index");
-			exit(0);
-		}
-		save_runtime_stack(frame, node->v);
-	} else if (is_list_integer(v_l, v_n)) {
-		if (v_n.u.integer >= ((ListObject*) v_l.u.object)->list.n) {
-			printf("index length too long");
-			exit(0);
-		};
-		save_runtime_stack(frame, ((ListObject* ) v_l.u.object)->list.data[v_n.u.integer]);
-	} else {
-		printf("error in vm_index");
-		exit(0);
-	}
-}
-void vm_func_call(Frame *frame, Instruction code) {
-	int pos = frame->runtime.n - code.v - 1;
-	Value *p = &(frame->runtime.data[pos]);
-	assert(p->type == OBJECT);
-	if (p->u.object->in_class == &G_function_class) {
-		FunctionObject *f_o = (FunctionObject*) p->u.object;
-		if (code.v != f_o->args_num) {
-			printf("function call args error2");
-			exit(0);
-		}
-		Frame curr_frame = init_frame(f_o->var.n);
-		int i;
-		for (i = 0; i < code.v; i++) {
-			curr_frame.value[i] = (frame->runtime.data)[frame->runtime.n - code.v + i];
-		}
-		save_frame(curr_frame);
-		Value rtn = vm((MyParserObject*) f_o);/*需要优化*/
-		/*执行结束后释放frame里面内容，并让frame_stack减1 free(curr_frame)*/
-		Frame *top_frame = pop_frame();
-		free_frame(top_frame);
-		/*当前运行栈中回退到调用之前的位置*/
-		frame->runtime.n = frame->runtime.n - code.v - 1;
-		/*把return的值插入到当前运行栈的栈顶*/
-		save_runtime_stack(frame, rtn);
-	} else if (p->u.object->in_class == &G_builtin_class) {
-		BuiltinObject *b_o = (BuiltinObject*) p->u.object;
-		if (code.v != b_o->args_n) {
-			printf("function call args error3");
-			exit(0);
-		}
-		b_o->in_func(b_o->args_n, p + 1);
-		frame->runtime.n = frame->runtime.n - code.v - 1;
-	} else if (p->u.object->in_class == &G_method_class) {
-		MethodObject *m_o = (MethodObject*) p->u.object;
-		FunctionObject *f_o = m_o->func;
-		InstanceObject *i_o = m_o->inst;
-		if (code.v != f_o->args_num) {
-			printf("function call args error2");
-			exit(0);
-		}
-		Frame curr_frame = init_frame(f_o->var.n + 1);
-		curr_frame.value[0] = obj2value(i_o);
-		int i;
-		for (i = 0; i < code.v; i++) {
-			curr_frame.value[i + 1] = (frame->runtime.data)[frame->runtime.n - code.v + i];
-		}
-		save_frame(curr_frame);
-		Value rtn = vm((MyParserObject*) f_o);
-		Frame *top_frame = pop_frame();
-		free_frame(top_frame);
-		frame->runtime.n = frame->runtime.n - code.v - 1;
-		save_runtime_stack(frame, rtn);
-	} else {
-		printf("function call error4");
-		exit(0);
-	}
-}
-void vm_build_class(Frame *frame, Instruction code) {
-	Value v_code = vector_pop(&frame->runtime);
-	ClassCodeObject *code_o = value2class_code(v_code);
-	save_frame(init_frame(code_o->var.n));
-	vm((MyParserObject*) code_o);/*这里执行完成后会在顶层frame里面放入执行后的值，把这个值与后续的classObject关联起来*/
-	Frame *class_frame = pop_frame();/*free(class_frame)*/
-	ClassObject *c_o = init_class_object(code_o, code_o->name);
-	Field fields;
-	int i;
-	for (i = 0; i < code_o->var.n; i++) {
-		fields.var = code_o->var.data[i];
-		fields.value = class_frame->value[i];
-		save_field(c_o, fields);
-	}
-	if (code_o->super_pos != -1) {
-		Frame *g_frame = buttom_frame();
-		c_o->super = value2class(g_frame->value[code_o->super_pos]);
-	}
-	frame->value[code.v] = obj2value(c_o);
-	free_frame(class_frame);
-}
-
-void vm_store_index(Frame *frame, Instruction code) {
-	Value v_value = vector_pop(&frame->runtime);
-	Value v_index = vector_pop(&frame->runtime);
-	Value v_list = vector_pop(&frame->runtime);
-	int idx = value2int(v_index);
-	ListObject *l_o = value2list(v_list);
-	int d_value = idx + 1 - l_o->list.n;
-	Value v;
-	v.type = NONE;
-	if (d_value > 0) {
-		int i;
-		for (i = 0; i < d_value; i++) {
-			vector_push(&l_o->list, Value, v);
-		}
-	}
-	l_o->list.data[idx] = v_value;
-	save_runtime_stack(frame, v_list);
-}
-
-int get_class_field(ClassObject *o, Var var, Value *v) {
-	ClassObject *tmp;
-	int i;
-	Field field;
-	for (tmp = o; tmp != NULL; tmp = tmp->super) {
-		for (i = tmp->fields.n - 1; i >= 0; i--) {
-			field = tmp->fields.data[i];
-			if (field.var == var) {
-				*v = field.value;
-				return 1;
-			}
-		}
-	}
-	return 0;
-}
-
-int get_instance_field(InstanceObject *i_o, Var var, Value *v) {
-	int i;
-	Field field;
-	for (i = i_o->fields.n - 1; i >= 0; i--) {
-		field = i_o->fields.data[i];
-		if (field.var == var) {
-			*v = field.value;
-			return 1;
-		}
-	}
-	return 0;
-}
-
-void vm_load_attr(Frame *frame, Var var) {
-	Value v = vector_pop(&frame->runtime);
-	assert(v.type == OBJECT);
-	if (v.u.object->in_class == &G_map_class) {
-		MapObject *m_o = (MapObject*) v.u.object;
-		StringObject *str = G_str_t.data[var];
-		int hash_value = util_key2index(str->str_char, m_o->capacity);
-		HashNode *node = get_hash_node(m_o->hash_table, str, hash_value);
-		if (node == NULL) {
-			printf("can not find map index");
-			exit(0);
-		}
-		save_runtime_stack(frame, node->v);
-	} else if (v.u.object->in_class == &G_class_class) {
-		Value this_v = frame->value[0];/*这里是方法内第一个值，指向自己的this*/
-		ClassObject *c_o = (ClassObject*) v.u.object;
-		InstanceObject *this_o = value2instance(this_v);
-		Value v_field;
-		if (get_class_field(c_o, var, &v_field) == 0) {
-			printf("can not find class field");
-			exit(0);
-		}
-		if (is_func_obj(v_field)) {
-			MethodObject *m_o = init_method_object((FunctionObject*) v_field.u.object, this_o);
-			v_field.u.object = (MyObject*) m_o;
-			save_runtime_stack(frame, v_field);
-		} else {
-			save_runtime_stack(frame, v_field);/*  后续使用内存拷贝的方式*/
-		}
-	} else if (v.u.object->in_class->code != NULL) {
-		InstanceObject *i_o = (InstanceObject*) v.u.object;
-		Value v_field;
-		if (get_instance_field(i_o, var, &v_field) == 0
-				&& get_class_field((ClassObject*) i_o->in_class, var, &v_field) == 0) {
-			printf("can not find member");
-			exit(0);
-		}
-		if (is_func_obj(v_field)) {
-			MethodObject *m_o = init_method_object((FunctionObject*) v_field.u.object, i_o);
-			v_field.u.object = (MyObject*) m_o;
-			save_runtime_stack(frame, v_field);
-		} else {
-			save_runtime_stack(frame, v_field);/*  后续使用内存拷贝的方式*/
-		}
-	} else {
-		printf("load attribute error");
-		exit(0);
-	}
-}
-
-void vm_store_attr(Frame *frame, Var var) { /*后续可能要加入map类型和class类型*/
-	Value v_attr = vector_pop(&frame->runtime);
-	Value v_instance = vector_pop(&frame->runtime);
-	InstanceObject *i_o = value2instance(v_instance);
-	Field field;
-	int i;
-	for (i = i_o->fields.n - 1; i >= 0; i--) {
-		field = i_o->fields.data[i];
-		if (field.var == var) {
-			(i_o->fields.data[i]).value = v_attr; /*如果已经存在则更改*/
-			return;
-		}
-	}
-	field.var = var;
-	field.value = v_attr;
-	save_field(i_o, field);
-}
-void vm_build_map(Frame *frame, Instruction code) {
-	int n = (code.v < 12) ? 12 : code.v;
-	MapObject *o = init_map_object(n);
-	int i;
-	for (i = 0; i < code.v; i++) {
-		Value v1 = vector_pop(&frame->runtime);
-		Value v2 = vector_pop(&frame->runtime);
-		StringObject *str = value2string(v2);
-		int hash_value = util_key2index(str->str_char, n);
-		save_hash_node(o->hash_table, v1, str, hash_value);
-	}
-	save_runtime_stack(frame, obj2value(o));
-}
-void vm_build_object(Frame *frame, Instruction code) {
-	int pos = frame->runtime.n - code.v - 1;
-	ClassObject *c_o = value2class(frame->runtime.data[pos]);
-	InstanceObject *i_o = init_instance_object(c_o);
-	Value rtn_v;
-	if (get_class_field(c_o, 1, &rtn_v) == 1) {/*查找初始化constructor的位置*/
-		FunctionObject *f_o = value2func(rtn_v);
-		if (code.v != f_o->args_num) {
-			printf("function call args error2");
-			exit(0);
-		}
-		Frame curr_frame = init_frame(f_o->var.n + 1);
-		curr_frame.value[0] = obj2value(i_o);
-		int i;
-		for (i = 0; i < code.v; i++) {
-			curr_frame.value[i + 1] = (frame->runtime.data)[frame->runtime.n - code.v + i];
-		}
-		save_frame(curr_frame);
-		vm((MyParserObject*) f_o);
-		Frame *top_frame = pop_frame();
-		free_frame(top_frame);
-		frame->runtime.n = pos;
-	}
-	save_runtime_stack(frame, obj2value(i_o));
-}
-
-void vm_super(Frame *frame) {
-	InstanceObject *this = value2instance(frame->value[0]);
-	Value v = obj2value(this->in_class->super);/*这里使用super加入到运行时栈，后续可能会引发bug*/
-	save_runtime_stack(frame, v);
-}
-
-Value vm(MyParserObject *p) {
-	Frame *frame = top_frame();
-	Instruction *codes = p->in_code.data;
-	Value rtn; /*这里接受返回值信息*/
-	rtn.type = NONE;
-	int i;
-	for (i = 0; i < p->in_code.n; i++) {
-		Instruction code = codes[i];
-		switch (code.op) {
-		case OP_PUSH: {
-			save_runtime_stack(frame, p->value.data[code.v]);
-			break;
-		}
-		case OP_LOAD: {
-			save_runtime_stack(frame, frame->value[code.v]);
-			break;
-		}
-		case OP_LOAD_GLOBAL: {
-			Frame *g_frame = buttom_frame(); /*获得最底层的frame栈就是全局*/
-			save_runtime_stack(frame, g_frame->value[code.v]);
-			break;
-		}
-		case OP_STORE: {
-			frame->value[code.v] = vector_pop(&frame->runtime);
-			break;
-		}
-		case OP_BUILD_CLASS: {
-			vm_build_class(frame, code);
-			break;
-		}
-		case OP_BUILD_OBJECT: {
-			vm_build_object(frame, code);
-			break;
-		}
-		case OP_BUILD_MAP: {
-			vm_build_map(frame, code);
-			break;
-		}
-		case OP_PLUS_SELF: {
-			Value *p_int = &(frame->value[code.v]);
-			assert(p_int->type == INTEGER);
-			p_int->u.integer++;
-			break;
-		}
-		case OP_FUNC_CALL: {
-			vm_func_call(frame, code);
-			break;
-		}
-		case OP_RETURN: {
-			rtn = vector_last(&frame->runtime);
-			return rtn;
-		}
-		case OP_LOAD_ATTR: {
-			vm_load_attr(frame, code.v);
-			break;
-		}
-		case OP_STORE_ATTR: {
-			vm_store_attr(frame, code.v);
-			break;
-		}
-		case OP_THIS: {
-			save_runtime_stack(frame, frame->value[0]);
-			break;
-		}
-		case OP_SUPER: {
-			vm_super(frame);
-			break;
-		}
-		case OP_NOT:
-			break;
-		case OP_MINUS:
-			break;
-		case OP_PLUS:
-		case OP_SUB:
-		case OP_MUL:
-		case OP_DIV:
-		case OP_EQ:
-		case OP_NOT_EQ:
-		case OP_OR:
-		case OP_AND:
-		case OP_LT_EQ:
-		case OP_GT_EQ:
-		case OP_NE:
-		case OP_GT:
-		case OP_LT: {
-			vm_binop_eval(frame, code);
-			break;
-		}
-		case OP_GOTO_IF_FALSE: {
-			Value v1 = vector_pop(&frame->runtime);
-			switch (v1.type) {
-			case FALSE:
-				i = code.v - 1;/*这里可能会有bug，后续可以考虑单独使用pc指向所在位置*/
-				break;
-			case TRUE:
-				break;
-			default: {
-				printf("type is error");
-				exit(0);
-			}
-			}
-			break;
-		}
-		case OP_GOTO: {
-			i = code.v - 1; /*因为i在循环结束会增加1，这里可能会有bug，后续可以考虑单独使用pc*/
-			break;
-		}
-		case OP_INDEX: {
-			vm_index(frame);
-			break;
-		}
-		case OP_BUILD_LIST: {
-			vm_build_list(frame, code);
-			break;
-		}
-		case OP_STORE_INDEX: {
-			vm_store_index(frame, code);
-			break;
-		}
-		case OP_ARRAY_LENGTH: {
-			vm_array_length(frame);
-			break;
-		}
-		case OP_CONST_INT: {
-			Value v_const;
-			v_const.type = INTEGER;
-			v_const.u.integer = code.v;
-			save_runtime_stack(frame, v_const);
-			break;
-		}
-		case OP_CONST_NULL: {
-			Value v_null;
-			v_null.type = NONE;
-			save_runtime_stack(frame, v_null);
-			break;
-		}
-		default:
-			printf("error   ,");
-			break;
-		};
-	}
-	return rtn;
-}
-
-void print_value(Value v) {
-	switch (v.type) {
-	case NUMBER:
-		printf("%f", v.u.number);
-		break;
-	case INTEGER:
-		printf("%d", v.u.integer);
-		break;
-	case TRUE:
-		printf("TRUE");
-		break;
-	case FALSE:
-		printf("FALSE");
-		break;
-	case NONE:
-		printf("NONE");
-		break;
-	case OBJECT: {
-		MyObject *o = v.u.object;
-		if (o->in_class == &G_string_class) {
-			printf("%s", ((StringObject*) o)->str_char);
-		} else if (o->in_class == &G_list_class) {
-			VectorValue l_obj = ((ListObject*) o)->list;
-			printf("[");
-			int i;
-			for (i = 0; i < l_obj.n; i++) {
-				if (i == l_obj.n - 1) {
-					print_value(l_obj.data[i]);
-				} else {
-					print_value(l_obj.data[i]);
-					printf(",");
-				}
-			}
-			printf("]");
-		} else if (o->in_class == &G_map_class) {
-			MapObject *m_obj = (MapObject*) o;
-			printf("{");
-			int i;
-			HashNode *tmp;
-			for (i = 0; i < m_obj->capacity; i++) {
-				tmp = m_obj->hash_table[i];
-				if (tmp != NULL) {
-					printf("%s:", tmp->string->str_char);
-					print_value(tmp->v);
-					tmp = tmp->next;
-					while (tmp != NULL) {
-						printf(",");
-						printf("%s:", tmp->string->str_char);
-						print_value(tmp->v);
-						tmp = tmp->next;
-					}
-					break;
-				}
-			}
-			for (i = i + 1; i < m_obj->capacity; i++) {
-				for (tmp = m_obj->hash_table[i]; tmp != NULL; tmp = tmp->next) {
-					printf(",");
-					printf("%s:", tmp->string->str_char);
-					print_value(tmp->v);
-				}
-			}
-			printf("}");
-		} else {
-			printf("type erorr");
-			exit(0);
-		}
-		break;
-	}
-	default: {
-		printf("type erorr");
-		exit(0);
-	}
-	}
-}
-
-void builtin_print_func(int args_num, Value *args) {
-	Value v = args[0];
-	print_value(v);
-	printf("\n");
-}
-
-void register_builtin_func(MyParserObject *p, char *name, int args_num, void *f) {
-	int pos = save_const_string(name);
-	save_incode(p, OP_PUSH, p->value.n);
-	BuiltinObject *b = (BuiltinObject*) gc_malloc(sizeof(BuiltinObject));
-	b->in_class = &G_builtin_class;
-	b->args_n = args_num;
-	b->in_func = f;
-	Value v = obj2value(b);
-	save_value(p, v);
-	save_incode(p, OP_STORE, save_loc_var(p, pos));
-}
-void global_register_func(MyParserObject *p) {
-	register_builtin_func(p, "print", 1, builtin_print_func);
-}
-Lexer* init_lexer(char *content) {
-	Lexer *lex = (Lexer*) malloc(sizeof(Lexer));
-	vector_new(&lex->buff, char);
-	lex->type = TOKEN_EOF;
-	lex->curr_line = 0;
-	lex->content = content;
-	lex->pos = 0;
-	lex->curr_char = content[lex->pos];
-	return lex;
-}
-void free_lexer() {
-	Lexer *lex = G_info.lexer;
-	free(lex->buff.data);
-	free(lex->content);
-	free(lex);
-	G_info.lexer = NULL;
-}
-
-char* read_file(char *file_name) {
-	FILE *fp = fopen(file_name, "r");
-	if (fp == NULL) {
-		printf("file %s open failed", file_name);
-		exit(1);
-	}
-	fseek(fp, 0, SEEK_END);
-	int file_size = ftell(fp);
-	if (file_size == 0) {
-		printf("file %s is empty", file_name);
-		exit(0);
-	};
-	rewind(fp);
-	char *content = (char*) malloc(file_size + 1);
-	memset(content, 0, file_size + 1);
-	fread(content, sizeof(char), file_size, fp);
-	fclose(fp);
-	return content;
-}
-void init_global() {
-	G_info.top_frame = 0;
-	G_info.gc_head = NULL;
-	G_info.gc_capacity = 128;
-	G_info.gc_count = 0;
-	G_info.top_parser = NULL;
-	vector_init(&G_str_t, StringObject*, 128);
-	char *inside_str[NUM_INSIDE] = { "null", "constructor", "this", "string", "list", "map", "function", "method",
-			"class", "module", "instance", "builtin" };
-	int i;
-	for (i = 0; i < NUM_INSIDE; i++) {
-		save_const_string(inside_str[i]);
-	}
-}
-
-void init_parser() {
-	char *file_name = "demo.js";
-	char *content = read_file(file_name);
-	Lexer *lex = init_lexer(content);
-	G_info.lexer = lex;
-	G_info.top_parser = (MyParserObject*) init_module_object(0);
-	global_register_func(G_info.top_parser);
-	parser_main(G_info.top_parser, lex);
-}
-void leave() {
-	MyObject *tmp, *curr;
-	curr = tmp = G_info.gc_head;
-	while (curr != NULL) {
-		tmp = curr;
-		curr = tmp->next;
-		free(tmp);
-	}
-	free_lexer();
-}
-void start_compile() {
-	Frame frame = init_frame(G_info.top_parser->var.n);
-	save_frame(frame);
-	vm(G_info.top_parser);
-	Frame *top_frame = pop_frame();
-	free_frame(top_frame);/*清空frame的数据*/
-}
-
-int main() {
-	init_global();
-	init_parser();
-	start_compile();
-	leave();
-	return 0;
+/*
+ * struct ListObject - list对象
+ * @OBJECT_HEAD：对象头
+ * @list：值数组
+ */
+typedef struct ListObject_
+{
+    OBJECT_HEAD
+    VecValue list;
+} ListObject;
+/*
+ * struct MemberObject - 成员对象
+ * @OBJECT_HEAD：对象头
+ * @caller：调用者
+ * @callee：被调用者
+ */
+typedef struct MemberObject_
+{
+    OBJECT_HEAD
+    MyObject *caller;
+    MyObject *callee;
+} MemberObject;
+/*
+ * struct BuildinObject - 内建函数对象
+ * @OBJECT_HEAD：对象头
+ * @inFunc：指向函数的指针，argsNum是输入参数，args是参数值，返回值是调用是否成功
+ */
+typedef struct BuildinObject_
+{
+    OBJECT_HEAD
+    int (*inFunc)(int argsNum, Value *args);
+} BuildinObject;
+/*
+ * struct GC - 标记清除垃圾回收结构体
+ * @head：对象链表的头，可以通过该链表找到所有对象
+ * @cap：gc容量
+ * @n：对象的数量，当对象大小超过gc容量大小，需要执行一次垃圾回收，并扩容gc容量
+ * @stringLink：空闲string对象链表，执行完垃圾回收会把需要删除的对象回收到这个链表中，
+ * 下次创建同样的对象时可以不用重新分配内存，从这个链表中把对象取出进行初始化
+ * @listLink：空闲list对象链表
+ * @mapLink：空闲map对象链表
+ * @insLink：空闲Instance对象链表
+ * @memLink：空闲Member对象链表
+ * @classLink：空闲class对象链表
+ * @nodeLink：空闲节点链表
+ */
+typedef struct GC_
+{
+    MyObject *head;
+    int cap;
+    int n;
+    MyObject *stringLink;
+    MyObject *listLink;
+    MyObject *mapLink;
+    MyObject *insLink;
+    MyObject *memLink;
+    MyObject *classLink;
+    HashNode *nodeLink;
+} GC;
+/*
+ * struct MyVm - 虚拟机
+ * @top：全局编译环境
+ * @stack：虚拟机栈
+ * @topStack：栈顶
+ * @globals：全局变量
+ * @gc：垃圾回收
+ * @stringClass：字符串类
+ * @listClass:list类
+ * @mapClass：map类
+ * @constructorStr：初始函数字符串
+ */
+typedef struct MyVm_
+{
+    MyCompiler *top;
+    Value stack[MAX_STACK];
+    int topStack;
+    HashMap globals;
+    GC gc;
+    ClassObject *stringClass;
+    ClassObject *listClass;
+    ClassObject *mapClass;
+    StringObject *constructorStr;
+} MyVm;
+
+MyVm vm; /*虚拟机全局变量*/
+
+MyObject *gcMalloc(int size);
+
+#define swap_gc_link(type, link) \
+    obj = (type)link;            \
+    link = link->next;           \
+    init_object_head(obj)
+
+/*
+ * initHashMap(HashMap *obj, int size) - 初始化哈希map
+ * @obj:哈希map
+ * @size:容量大小
+ *
+ * Return:void
+ */
+void initHashMap(HashMap *obj, int size)
+{
+    obj->cap = size;
+    obj->n = 0;
+    obj->hashNode = (HashNode **)malloc(sizeof(HashNode *) * size);
+    int i;
+    for (i = 0; i < size; i++)
+    {
+        obj->hashNode[i] = NULL;
+    }
+}
+/*
+ * initHashNode(StringObject *str, Value v, HashNode *next) - 初始化哈希map节点
+ * @str:字符串
+ * @v:值
+ * @next：下一个节点
+ *
+ * 首先判断空闲列表nodeLink是否是空的，如果不是空就从空闲列表中取出对象进行初始化
+ * 如果空闲列表是空的通过malloc创建内存进行初始化
+ *
+ * Return:初始化后的节点
+ */
+HashNode *initHashNode(StringObject *str, Value v, HashNode *next)
+{
+    HashNode *obj = NULL;
+    if (vm.gc.nodeLink != NULL)
+    {
+        obj = vm.gc.nodeLink;
+        vm.gc.nodeLink = vm.gc.nodeLink->next;
+        obj->next = NULL;
+    }
+    else
+    {
+        obj = (HashNode *)malloc(sizeof(HashNode));
+    }
+    obj->string = str;
+    obj->v = v;
+    obj->next = next;
+    return obj;
+}
+/*
+ * getHashNode(HashMap *obj, StringObject *str, int pos) - 通过字符串及位置从哈希map获得节点信息
+ * @obj:哈希map
+ * @str:字符串
+ * @pos:位置
+ *
+ * 首先通过pos找到该字符串所在节点信息，如果循环节点所在的链表对比字符串哈希值找到字符串所在的节点
+ * 如果没有查找到返回空
+ *
+ * Return:节点
+ */
+HashNode *getHashNode(HashMap *obj, StringObject *str, int pos)
+{
+    HashNode *tmp;
+    for (tmp = obj->hashNode[pos]; tmp != NULL; tmp = tmp->next)
+    {
+        if (tmp->string->hash == str->hash)
+        {
+            return tmp;
+        }
+    }
+    return NULL;
+}
+/*
+ * getHashMap(HashMap *obj, StringObject *str)- 通过字符串从哈希map获得节点信息
+ * @obj:哈希map
+ * @str:字符串
+ *
+ * 首先通过对字符串哈希值和哈希map的容量求余，获得字符串在哈希map中的位置，调用getHashNode获得节点信息
+ *
+ * Return:节点
+ */
+HashNode *getHashMap(HashMap *obj, StringObject *str)
+{
+    int pos = str->hash % obj->cap;
+    HashNode *node = getHashNode(obj, str, pos);
+    return node;
+}
+/*
+ * saveHashNode(HashMap *obj, StringObject *str, Value v)- 保存字符串及值到哈希map
+ * @obj:哈希map
+ * @str:字符串
+ * @v:值
+ *
+ * 首先判断哈希map中时候有该字符串，如果有把值写入该节点的值字段中
+ * 然后判断哈希map中元素的数量，如果元素数量大于容量的3倍，把容量扩容3倍，并把原来的节点重新排列重组
+ * 最后把字符串及值插入到对应的节点
+ *
+ * Return:节点
+ */
+HashNode *saveHashNode(HashMap *obj, StringObject *str, Value v)
+{
+    int pos = str->hash % obj->cap;
+    HashNode *node = getHashNode(obj, str, pos);
+    if (node != NULL)
+    {
+        node->v = v;
+        return node;
+    }
+    if (obj->n > obj->cap * 3)
+    {
+        int oldCap = obj->cap;
+        int newCap = oldCap * 3;
+        HashNode **old = obj->hashNode;
+        HashNode **new = (HashNode **)malloc(sizeof(HashNode *) * newCap);
+        int i;
+        HashNode *tmp, *curr;
+        for (i = 0; i < obj->cap; i++)
+        {
+            curr = old[i];
+            while (curr != NULL)
+            {
+                tmp = curr;
+                curr = curr->next;
+                int newPos = tmp->string->hash % newCap;
+                tmp->next = new[newPos];
+                new[newPos] = tmp;
+            }
+        }
+        free(old);
+        obj->hashNode = new;
+        obj->cap = newCap;
+        pos = str->hash % obj->cap;
+        obj->hashNode[pos] = initHashNode(str, v, obj->hashNode[pos]);
+        obj->n++;
+        return obj->hashNode[pos];
+    }
+    else
+    {
+        obj->hashNode[pos] = initHashNode(str, v, obj->hashNode[pos]);
+        obj->n++;
+        return obj->hashNode[pos];
+    }
+}
+/*
+ * initStringObject(char *str) - 初始化字符串对象
+ * @str:字符串
+ *
+ * 首先判断空闲列表stringLink是否是空的，如果不是空就从空闲列表中取出对象进行初始化
+ * 如果空闲列表是空的通过gcMalloc创建内存进行初始化
+ *
+ * Return:字符串对象
+ */
+StringObject *initStringObject(char *str)
+{
+    StringObject *obj = NULL;
+    if (vm.gc.stringLink != NULL)
+    {
+        swap_gc_link(StringObject *, vm.gc.stringLink);
+    }
+    else
+    {
+        obj = (StringObject *)gcMalloc(sizeof(StringObject));
+    }
+    obj->type = STRING_OBJ;
+    obj->len = strlen(str);
+    obj->hash = utilKey2Hash(str, obj->len);
+    obj->str = str;
+    return obj;
+}
+/*
+ * initClass(StringObject *name, ClassObject *super, int count) - 初始化class对象
+ * @name:类名
+ * @super:父类
+ * @count:成员数量
+ *
+ * 首先判断空闲列表ClassObject是否是空的，如果不是空就从空闲列表中取出对象进行初始化
+ * 如果空闲列表是空的通过gcMalloc创建内存进行初始化
+ * 防止传入的成员数是0，成员数量+12作为类成员容量的初始值
+ * 如果父类不是空，把父类的成员变量复制到本类中
+ *
+ * Return:class对象
+ */
+ClassObject *initClass(StringObject *name, ClassObject *super, int count)
+{
+    ClassObject *obj = NULL;
+    if (vm.gc.classLink != NULL)
+    {
+        swap_gc_link(ClassObject *, vm.gc.classLink);
+    }
+    else
+    {
+        obj = (ClassObject *)gcMalloc(sizeof(ClassObject));
+    }
+    obj->type = CLASS_OBJ;
+    initHashMap(&obj->fields, count + 12);
+    obj->name = name;
+    obj->super = super;
+    if (super != NULL)
+    {
+        int i;
+        HashNode *tmp;
+        for (i = 0; i < super->fields.cap; i++)
+        {
+            for (tmp = super->fields.hashNode[i]; tmp != NULL; tmp = tmp->next)
+            {
+                int pos = tmp->string->hash % obj->fields.cap;
+                obj->fields.hashNode[pos] = initHashNode(tmp->string, tmp->v, obj->fields.hashNode[pos]);
+            }
+        }
+        obj->fields.n = super->fields.n;
+    }
+    return obj;
+}
+/*
+ * initMemberObject(MyObject *caller, MyObject *callee) - 初始化member对象
+ * @caller:调用者
+ * @callee:被调用者
+ *
+ * Return:member对象
+ */
+MemberObject *initMemberObject(MyObject *caller, MyObject *callee)
+{
+    MemberObject *obj = NULL;
+    if (vm.gc.memLink != NULL)
+    {
+        swap_gc_link(MemberObject *, vm.gc.memLink);
+    }
+    else
+    {
+        obj = (MemberObject *)gcMalloc(sizeof(MemberObject));
+    }
+    obj->type = MEMBER_OBJ;
+    obj->caller = caller;
+    obj->callee = callee;
+    return obj;
+}
+/*
+ * initInstanceObject(ClassObject *co) - 初始化实例对象
+ * @co:实例所属的类
+ *
+ * Return:实例对象
+ */
+InstanceObject *initInstanceObject(ClassObject *co)
+{
+    InstanceObject *obj = NULL;
+    if (vm.gc.insLink != NULL)
+    {
+        swap_gc_link(InstanceObject *, vm.gc.insLink);
+    }
+    else
+    {
+        obj = (InstanceObject *)gcMalloc(sizeof(InstanceObject));
+    }
+    obj->type = INSTANCE_OBJ;
+    initHashMap(&obj->fields, co->fields.cap + RESERVE_MAP_CAP);
+    obj->inClass = co;
+    return obj;
+}
+/*
+ * initMapObject(int count) - 初始化map对象
+ * @count:容量
+ *
+ * Return:map对象
+ */
+MapObject *initMapObject(int count)
+{
+    MapObject *obj = NULL;
+    if (vm.gc.mapLink != NULL)
+    {
+        swap_gc_link(MapObject *, vm.gc.mapLink);
+    }
+    else
+    {
+        obj = (MapObject *)gcMalloc(sizeof(MapObject));
+    }
+    obj->type = MAP_OBJ;
+    initHashMap(&obj->map, count + RESERVE_MAP_CAP);
+    return obj;
+}
+/*
+ * initListObject(int count) - 初始化list对象
+ * @count:容量
+ *
+ * Return:list对象
+ */
+ListObject *initListObject(int count)
+{
+    ListObject *obj = NULL;
+    if (vm.gc.listLink != NULL)
+    {
+        swap_gc_link(ListObject *, vm.gc.listLink);
+    }
+    else
+    {
+        obj = (ListObject *)gcMalloc(sizeof(ListObject));
+    }
+    obj->type = LIST_OBJ;
+    initValueVec(&obj->list, count);
+    obj->list.n = count;
+    return obj;
+}
+void registerStdlib();
+/*
+ * initGc(GC *gc) - 初始化垃圾回收gc
+ * @gc:垃圾回收
+ *
+ * Return:void
+ */
+void initGc(GC *gc)
+{
+    gc->cap = INIT_GC_CAP;
+    gc->n = 0;
+    gc->head = NULL;
+    gc->stringLink = NULL;
+    gc->listLink = NULL;
+    gc->mapLink = NULL;
+    gc->insLink = NULL;
+    gc->memLink = NULL;
+    gc->classLink = NULL;
+    gc->nodeLink = NULL;
+}
+ClassObject *stdAddClass(char *name);
+/*
+ * initVm(MyCompiler *top) - 初始化虚拟机
+ * @top:全局编译环境
+ *
+ * Return:void
+ */
+void initVm(MyCompiler *top)
+{
+    vm.top = top;
+    vm.topStack = 0;
+    initHashMap(&vm.globals, GLOBAL_VARS);
+    initGc(&vm.gc);
+    vm.stringClass = stdAddClass("String");
+    vm.listClass = stdAddClass("List");
+    vm.mapClass = stdAddClass("Map");
+    vm.constructorStr = initStringObject(utilStrdup("constructor"));
+    registerStdlib();
+}
+/*
+ * pushStack(Value value) - 向虚拟栈栈顶插入数据
+ * @value:值
+ *
+ * Return:void
+ */
+void pushStack(Value value)
+{
+    vm.stack[vm.topStack] = value;
+    vm.topStack++;
+}
+/*
+ * popStack() - 从虚拟栈栈顶弹出元素
+ *
+ * Return:值
+ */
+Value popStack()
+{
+    vm.topStack--;
+    return vm.stack[vm.topStack];
+}
+int startVm(MyCompiler *c, int start);
+/*
+ * concatString(Value l, Value r) - 拼接两个字符串对象成一个字符串对象
+ * @l：左值
+ * @r：右值
+ *
+ * Return:字符串对象
+ */
+StringObject *concatString(Value l, Value r)
+{
+    StringObject *s1 = (StringObject *)l.u.object;
+    StringObject *s2 = (StringObject *)r.u.object;
+    char *tmp = (char *)malloc(s1->len + s1->len + 1);
+    strcpy(tmp, s1->str);
+    strcat(tmp, s2->str);
+    StringObject *str = initStringObject(tmp);
+    return str;
+}
+/*
+ * concatList(Value l, Value r) - 拼接两个list对象成一个list对象
+ * @l：左值
+ * @r：右值
+ *
+ * Return:list对象
+ */
+ListObject *concatList(Value l, Value r)
+{
+    ListObject *l1 = (ListObject *)l.u.object;
+    ListObject *l2 = (ListObject *)r.u.object;
+    int count = l1->list.n + l2->list.n;
+    ListObject *obj = initListObject(count);
+    int i, j;
+    for (i = 0; i < l1->list.n; i++)
+    {
+        obj->list.data[i] = l1->list.data[i];
+    }
+    for (j = 0; j < l2->list.n; j++)
+    {
+        obj->list.data[i + j] = l2->list.data[j];
+    }
+    return obj;
+}
+/*
+ * setError(char *errMsg) - 输出错误信息并返回错误标识
+ * @errMsg：错误信息
+ *
+ * Return:错误标识，1代表错误
+ */
+int setError(char *errMsg)
+{
+    printf("runTimeError:%s \n", errMsg);
+    return 1;
+}
+/*
+ * funcEntry(MyObject *obj, int this, int argsNum) - 方法执行的入口
+ * @obj：函数对象
+ * @this:函数在虚拟栈的位置
+ * @argsNum：函数参数
+ *
+ * 如果函数对象是编译型对象调用startVm执行，如果是内建函数调用指向函数的指针
+ *
+ * Return:错误标识
+ */
+int funcEntry(MyObject *obj, int this, int argsNum)
+{
+    int res = 0;
+    switch (obj->type)
+    {
+    case COMPILER_OBJ:
+    {
+        if (((MyCompiler *)obj)->argsNum != argsNum)
+        {
+            return setError("argument error");
+        }
+        res = startVm((MyCompiler *)obj, this);
+        break;
+    }
+    case BUILDIN_OBJ:
+    {
+        res = ((BuildinObject *)obj)->inFunc(argsNum, &(vm.stack[this]));
+        vm.topStack = this + 1;
+        break;
+    }
+    default:
+    {
+        return setError("object can not call");
+    }
+    }
+    return res;
+}
+/*
+ * classFunc(ClassObject *co, StringObject *name, int this, int argsNum) - 从class中找成员变量并调用
+ * @co：对象所属的类
+ * @name:成员变量名
+ * @this：函数在虚拟栈的位置
+ * @argsNum：函数参数
+ *
+ * 从对象所属的类中找是否存在成员变量，如果存在则调用该成员方法
+ *
+ * Return:错误标识
+ */
+int classFunc(ClassObject *co, StringObject *name, int this, int argsNum)
+{
+    HashNode *node = getHashMap(&co->fields, name);
+    if (node == NULL)
+    {
+        return setError("method not found in class");
+    }
+    if (node->v.type != OBJECT)
+    {
+        return setError("type error");
+    }
+    return funcEntry(node->v.u.object, this, argsNum);
+}
+/*
+ * functionCall(int argsNum) - 函数调用
+ * @argsNum：函数参数
+ *
+ * 判断待调起的对象是否是MemberObject对象，如果是函数执行位置改成调起者，把函数对象改成被调起者
+ * 如果不是MemberObject对象，调用funcEntry方法
+ *
+ * Return:错误标识
+ */
+int functionCall(int argsNum)
+{
+    int this = vm.topStack - argsNum - 1;
+    Value val = vm.stack[this];
+    if (val.type != OBJECT)
+    {
+        return setError("object can not call");
+    }
+    MyObject *obj = val.u.object;
+    if (obj->type == MEMBER_OBJ)
+    {
+        MemberObject *m = (MemberObject *)obj;
+        vm.stack[this] = obj_to_val(m->caller);
+        return funcEntry(m->callee, this, argsNum);
+    }
+    else
+    {
+        return funcEntry(obj, this, argsNum);
+    }
+}
+/*
+ * methodCall(StringObject *name, int argsNum) - 方法调用
+ * @name：成员变量名
+ * @argsNum：函数参数
+ *
+ * 判断待调起的值是否是super，如果是，把函数执行位置改成super对应的实例对象，执行classFunc方法
+ * 判断待调起的对象是否是字符串对象或者列表对象或者map对象，如果是，在对象所属的类中查到变量名，并执行相应的操作
+ * 判断待调起的对象是否实例，如果是，通过成员变量名在实例中查到，如果在实例中查找不到在实例所属的类中查找，并执行相应的操作
+ *
+ * Return:错误标识
+ */
+int methodCall(StringObject *name, int argsNum)
+{
+    int this = vm.topStack - argsNum - 1;
+    Value val = vm.stack[this];
+    if (val.type == SUPER)
+    {
+        vm.stack[this] = obj_to_val(val.u.object);
+        InstanceObject *ins = (InstanceObject *)val.u.object;
+        if (ins->inClass->super == NULL)
+        {
+            return setError("super is null object");
+        }
+        return classFunc(ins->inClass->super, name, this, argsNum);
+    }
+    if (val.type != OBJECT)
+    {
+        return setError("can not execute method");
+    }
+    switch (val.u.object->type)
+    {
+    case STRING_OBJ:
+    {
+        return classFunc(vm.stringClass, name, this, argsNum);
+    }
+    case LIST_OBJ:
+    {
+        return classFunc(vm.listClass, name, this, argsNum);
+    }
+    case MAP_OBJ:
+    {
+        return classFunc(vm.mapClass, name, this, argsNum);
+    }
+    case INSTANCE_OBJ:
+    {
+        InstanceObject *ins = (InstanceObject *)val.u.object;
+        HashNode *node = getHashMap(&ins->fields, name);
+        if (node == NULL)
+        {
+            return classFunc(ins->inClass, name, this, argsNum);
+        }
+        else
+        {
+            if (node->v.type != OBJECT)
+            {
+                return setError("type error");
+            }
+            return funcEntry(node->v.u.object, this, argsNum);
+        }
+    }
+    default:
+    {
+        return setError("object can not execute method");
+    }
+    }
+}
+int stdString(int argsNum, Value *args);
+/*
+ * stdList(int argsNum, Value *args) - 通过字面的方式创建list对象
+ * @argsNum：参数数量
+ * @args：参数值
+ *
+ * 判断参数数量，如果数量是空，list的容量设置成0
+ * 如果参数是1，读取参数值，把参数值设置成list的容量
+ *
+ * Return:错误标识
+ */
+int stdList(int argsNum, Value *args)
+{
+    int n;
+    switch (argsNum)
+    {
+    case 0:
+        n = 0;
+        break;
+    case 1:
+    {
+        Value v = args[1];
+        if (v.type != NUMBER)
+        {
+            return setError("argument error");
+        }
+        n = (int)v.u.number;
+        break;
+    }
+    default:
+        return setError("argument error");
+    }
+    ListObject *lst = initListObject(n);
+    int i;
+    for (i = 0; i < n; i++)
+    {
+        lst->list.data[i] = (Value){NONE};
+    }
+    args[0] = obj_to_val((MyObject *)lst);
+    return 0;
+}
+/*
+ * stdMap(int argsNum, Value *args) - 通过字面的方式创建map对象
+ * @argsNum：参数数量
+ * @args：参数值
+ *
+ * 判断参数数量，如果数量是空，map的容量设置成0
+ * 如果参数是1，读取参数值，把参数值设置成map的容量
+ *
+ * Return:错误标识
+ */
+int stdMap(int argsNum, Value *args)
+{
+    int n;
+    switch (argsNum)
+    {
+    case 0:
+        n = 0;
+        break;
+    case 1:
+    {
+        Value v = args[1];
+        if (v.type != NUMBER)
+        {
+            return setError("argument error");
+        }
+        n = (int)v.u.number;
+        break;
+    }
+    default:
+        return setError("argument error");
+    }
+    MyObject *obj = (MyObject *)initMapObject(n);
+    args[0] = obj_to_val(obj);
+    return 0;
+}
+/*
+ * buildObject(ClassObject *co, int this, int argsNum) - 创建对象
+ * @co：对象所属的类
+ * @this：函数在虚拟栈的位置
+ * @argsNum：函数参数
+ *
+ * 判断co是否是stringClass或者listClass或者mapClass，如果是创建相应的对象
+ * 如果不是，则创建实例对象，并查到实例对象中是否包含constructor成员变量，如果不包含且参数大约0说明参数有误
+ * 如果包含constructor，则通过调用startVm初始化实例
+ *
+ * Return:错误标识
+ */
+int buildObject(ClassObject *co, int this, int argsNum)
+{
+    if (co == vm.stringClass)
+    {
+        return stdString(argsNum, &vm.stack[this]);
+    }
+    if (co == vm.listClass)
+    {
+        return stdList(argsNum, &vm.stack[this]);
+    }
+    if (co == vm.mapClass)
+    {
+        return stdMap(argsNum, &vm.stack[this]);
+    }
+    MyObject *obj = (MyObject *)initInstanceObject(co);
+    vm.stack[this] = obj_to_val(obj);
+    HashNode *node = getHashMap(&co->fields, vm.constructorStr);
+    if (node == NULL && argsNum != 0)
+    {
+        return setError("arguments error");
+    }
+    if (node != NULL)
+    {
+        if (node->v.type != OBJECT && node->v.u.object->type != COMPILER_OBJ)
+        {
+            return setError("constructor must be COMPILER_OBJ type");
+        }
+        int res = startVm((MyCompiler *)node->v.u.object, this);
+        vm.stack[this] = obj_to_val(obj);
+        vm.topStack = this + 1;
+        return res;
+    }
+    return 0;
+}
+/*
+ * runTimeError(StringObject *name, int line, char *errMsg) - 运行时错误信息
+ * @name：编译环境名称
+ * @line：行信息
+ * @errMsg：错误信息
+ *
+ * Return:错误标识
+ */
+int runTimeError(StringObject *name, int line, char *errMsg)
+{
+    if (errMsg != NULL)
+    {
+        setError(errMsg);
+    }
+    printf(">>>>>> line [%d],in %s \n", line, name->str);
+    return 1;
+}
+
+#define run_time_error(msg) runTimeError(c->name, c->lines.data[ip], msg)
+
+#define load_attr_obj(nodeVal)                                                                 \
+    do                                                                                         \
+    {                                                                                          \
+        if (nodeVal.type == OBJECT &&                                                          \
+            (nodeVal.u.object->type == COMPILER_OBJ || nodeVal.u.object->type == BUILDIN_OBJ)) \
+        {                                                                                      \
+            MemberObject *mo = initMemberObject(val.u.object, nodeVal.u.object);               \
+            vm.stack[vm.topStack - 1] = obj_to_val(mo);                                        \
+        }                                                                                      \
+        else                                                                                   \
+        {                                                                                      \
+            vm.stack[vm.topStack - 1] = nodeVal;                                               \
+        }                                                                                      \
+    } while (0)
+
+#define exp_is_bool(left, right) \
+    (left.type == TRUE || left.type == FALSE) && (right.type == TRUE || right.type == FALSE)
+
+#define exp_is_number(left, right)                                \
+    do                                                            \
+    {                                                             \
+        if (left.type != right.type && left.type != NUMBER)       \
+        {                                                         \
+            return run_time_error("an error occurred in option"); \
+        }                                                         \
+    } while (0)
+/*
+ * startVm(MyCompiler *c, int start) - 虚拟机启动
+ * @c：编译环境
+ * @start：运行时栈的起始位置
+ *
+ * startVm是函数的执行入口
+ * 首先判断编译环境的占用多少运行时栈加上已经占用的数量会不会超过最大运行时栈，如果超过直接报错
+ * 循环编译环境的字节码，判断操作码是那种类型进入到不同的分支下面执行
+ *
+ * Return:错误标识
+ */
+int startVm(MyCompiler *c, int start)
+{
+    if (c->maxOccupyStack + vm.topStack >= MAX_STACK)
+    {
+        printf("runtime stack is full");
+        exit(1);
+    }
+    vm.topStack = vm.topStack + c->var.n + 1;
+    Value *consts = c->consts.data;
+    int *inData = c->inCode.data;
+    int ip = 0;
+    while (1)
+    {
+        switch (inData[ip])
+        {
+        case OP_PUSH:
+        {
+            pushStack(consts[OP_VALUE]);
+            break;
+        }
+        case OP_LOAD:
+        {
+            pushStack(vm.stack[start + OP_VALUE]);
+            break;
+        }
+        case OP_LOAD_GLOBAL:
+        {
+            StringObject *key = (StringObject *)(consts[OP_VALUE].u.object);
+            HashNode *node = getHashMap(&vm.globals, key);
+            if (node == NULL)
+            {
+                return run_time_error("can not find variable");
+            }
+            pushStack(node->v);
+            break;
+        }
+        case OP_STORE_GLOBAL:
+        {
+            StringObject *key = (StringObject *)(consts[OP_VALUE].u.object);
+            Value v = popStack();
+            saveHashNode(&vm.globals, key, v);
+            break;
+        }
+        case OP_STORE:
+        {
+            vm.stack[start + OP_VALUE] = popStack();
+            break;
+        }
+        case OP_CONST_NULL:
+        {
+            pushStack((Value){NONE});
+            break;
+        }
+        case OP_CONST_FALSE:
+        {
+            pushStack((Value){FALSE});
+            break;
+        }
+        case OP_CONST_TRUE:
+        {
+            pushStack((Value){TRUE});
+            break;
+        }
+        case OP_CONST_INT:
+        {
+            pushStack(num_to_val(OP_VALUE));
+            break;
+        }
+        case OP_BUILD_CLASS:
+        {
+            StringObject *name = (StringObject *)(consts[OP_VALUE].u.object);
+            ClassObject *parents = NULL;
+            Value v1 = popStack();
+            if (v1.type != NONE)
+            {
+                if (v1.u.object->type != CLASS_OBJ ||
+                    v1.u.object == (MyObject *)vm.stringClass ||
+                    v1.u.object == (MyObject *)vm.listClass ||
+                    v1.u.object == (MyObject *)vm.mapClass)
+                {
+                    return run_time_error("extend object must class object");
+                }
+                parents = (ClassObject *)v1.u.object;
+            }
+            int count = (int)(popStack()).u.number;
+            ClassObject *obj = initClass(name, parents, count);
+            Value key, val;
+            int i;
+            for (i = 0; i < count; i++)
+            {
+                val = popStack();
+                key = popStack();
+                saveHashNode(&obj->fields, (StringObject *)key.u.object, val);
+            }
+            saveHashNode(&vm.globals, name, obj_to_val(obj));
+            break;
+        }
+        case OP_BUILD_OBJECT:
+        {
+            int argsNum = OP_VALUE;
+            int this = vm.topStack - argsNum - 1;
+            Value val = vm.stack[this];
+            if (val.type != OBJECT && val.u.object->type != CLASS_OBJ)
+            {
+                return run_time_error("must class object");
+            }
+            ClassObject *co = (ClassObject *)val.u.object;
+            if (buildObject(co, this, argsNum) != 0)
+            {
+                return run_time_error(NULL);
+            }
+            break;
+        }
+        case OP_BUILD_MAP:
+        {
+            int count = OP_VALUE;
+            MapObject *obj = initMapObject(count);
+            Value key, val;
+            int i;
+            for (i = 0; i < count; i++)
+            {
+                val = popStack();
+                key = popStack();
+                saveHashNode(&obj->map, (StringObject *)key.u.object, val);
+            }
+            pushStack(obj_to_val(obj));
+            break;
+        }
+        case OP_BUILD_LIST:
+        {
+            int count = OP_VALUE;
+            ListObject *obj = initListObject(count);
+            int i;
+            for (i = 1; i <= count; i++)
+            {
+                obj->list.data[count - i] = popStack();
+            }
+            pushStack(obj_to_val(obj));
+            break;
+        }
+        case OP_PLUS_SELF:
+        {
+            (vm.stack[start + OP_VALUE]).u.number++;
+            break;
+        }
+        case OP_FUNC_CALL:
+        {
+            int argsNum = OP_VALUE;
+            int res = functionCall(argsNum);
+            if (res != 0)
+            {
+                return run_time_error(NULL);
+            }
+            break;
+        }
+        case OP_METHOD_CALL:
+        {
+            StringObject *name = (StringObject *)(consts[OP_VALUE].u.object);
+            int argsNum = (int)(popStack()).u.number;
+            int res = methodCall(name, argsNum);
+            if (res != 0)
+            {
+                return run_time_error(NULL);
+            }
+            break;
+        }
+        case OP_RETURN:
+        {
+            Value rtn = popStack();
+            vm.topStack = start;
+            pushStack(rtn);
+            return 0;
+        }
+        case OP_LOAD_ATTR:
+        {
+            StringObject *name = (StringObject *)(consts[OP_VALUE].u.object);
+            Value val = vm.stack[vm.topStack - 1];
+            if (val.type == SUPER)
+            {
+                InstanceObject *ins = (InstanceObject *)val.u.object;
+                if (ins->inClass->super == NULL)
+                {
+                    return run_time_error("super is null");
+                }
+                ClassObject *co = ins->inClass->super;
+                HashNode *node = getHashMap(&co->fields, name);
+                if (node == NULL)
+                {
+                    return run_time_error("can not load attribute");
+                }
+                load_attr_obj(node->v);
+            }
+            else if (val.type == OBJECT && val.u.object->type == INSTANCE_OBJ)
+            {
+                InstanceObject *ins = (InstanceObject *)val.u.object;
+                HashNode *node = getHashMap(&ins->fields, name);
+                if (node == NULL)
+                {
+                    node = getHashMap(&ins->inClass->fields, name);
+                }
+                if (node == NULL)
+                {
+                    return run_time_error("can not load attribute");
+                }
+                load_attr_obj(node->v);
+            }
+            else if (val.type == OBJECT && val.u.object->type == MAP_OBJ)
+            {
+                MapObject *map = (MapObject *)val.u.object;
+                HashNode *node = getHashMap(&map->map, name);
+                if (node == NULL)
+                {
+                    return run_time_error("can not load attribute");
+                }
+                vm.stack[vm.topStack - 1] = node->v;
+            }
+            else
+            {
+                return run_time_error("can not load attribute");
+            }
+            break;
+        }
+        case OP_STORE_ATTR:
+        {
+            StringObject *name = (StringObject *)(consts[OP_VALUE].u.object);
+            Value callee = popStack();
+            Value caller = popStack();
+            if (caller.type != OBJECT)
+            {
+                return run_time_error("can not store attribute");
+            }
+            switch (caller.u.object->type)
+            {
+            case INSTANCE_OBJ:
+            {
+                InstanceObject *ins = (InstanceObject *)caller.u.object;
+                saveHashNode(&ins->fields, name, callee);
+                break;
+            }
+            case MAP_OBJ:
+            {
+                MapObject *map = (MapObject *)caller.u.object;
+                saveHashNode(&map->map, name, callee);
+                break;
+            }
+            default:
+            {
+                return run_time_error("can not store attribute");
+            }
+            }
+            break;
+        }
+        case OP_THIS:
+        {
+            Value val = vm.stack[start];
+            if (val.type != OBJECT && val.u.object->type != INSTANCE_OBJ)
+            {
+                return run_time_error("this type error");
+            }
+            pushStack(val);
+            break;
+        }
+        case OP_SUPER:
+        {
+            Value val = vm.stack[start];
+            if (val.type != OBJECT && val.u.object->type != INSTANCE_OBJ)
+            {
+                return run_time_error("super type error");
+            }
+            val.type = SUPER;
+            pushStack(val);
+            break;
+        }
+        case OP_PLUS:
+        {
+            Value r = vm.stack[vm.topStack - 1]; /*因该操作可能会引起gc回收，防止被gc回收不用pop操作*/
+            Value l = vm.stack[vm.topStack - 2];
+            switch (l.type)
+            {
+            case NUMBER:
+            {
+                if (r.type != NUMBER)
+                {
+                    return run_time_error("an error occurred in +");
+                }
+                vm.stack[vm.topStack - 2] = num_to_val(l.u.number + r.u.number);
+                break;
+            }
+            case OBJECT:
+            {
+                if (l.u.object->type != r.u.object->type)
+                {
+                    return run_time_error("an error occurred in +");
+                }
+                if (l.u.object->type == STRING_OBJ)
+                {
+                    StringObject *str = concatString(l, r);
+                    vm.stack[vm.topStack - 2] = obj_to_val(str);
+                }
+                else if (l.u.object->type == LIST_OBJ)
+                {
+                    ListObject *lst = concatList(l, r);
+                    vm.stack[vm.topStack - 2] = obj_to_val(lst);
+                }
+                else
+                {
+                    return run_time_error("an error occurred in +");
+                }
+                break;
+            }
+            default:
+            {
+                return run_time_error("an error occurred in +");
+            }
+            }
+            vm.topStack--;
+            break;
+        }
+        case OP_SUB:
+        {
+            Value r = popStack();
+            Value l = popStack();
+            exp_is_number(l, r);
+            pushStack(num_to_val(l.u.number - r.u.number));
+            break;
+        }
+        case OP_MUL:
+        {
+            Value r = popStack();
+            Value l = popStack();
+            exp_is_number(l, r);
+            pushStack(num_to_val(l.u.number * r.u.number));
+            break;
+        }
+        case OP_DIV:
+        {
+            Value r = popStack();
+            Value l = popStack();
+            exp_is_number(l, r);
+            if (r.u.number == 0)
+            {
+                return run_time_error("divide zero");
+            }
+            pushStack(num_to_val(l.u.number / r.u.number));
+            break;
+        }
+        case OP_EQ:
+        {
+            Value r = popStack();
+            Value l = popStack();
+            Value val;
+            if (exp_is_bool(l, r))
+            {
+                val.type = (l.type == r.type) ? TRUE : FALSE;
+            }
+            else
+            {
+                if (l.type != r.type)
+                {
+                    return run_time_error("an error occurred in option");
+                }
+                switch (l.type)
+                {
+                case NUMBER:
+                {
+                    val.type = (l.u.number == r.u.number) ? TRUE : FALSE;
+                    break;
+                }
+                case OBJECT:
+                {
+                    val.type = (l.u.object == r.u.object) ? TRUE : FALSE;
+                    break;
+                }
+                default:
+                {
+                    return run_time_error("an error occurred in option");
+                }
+                }
+            }
+            pushStack(val);
+            break;
+        }
+        case OP_NOT_EQ:
+        {
+            Value r = popStack();
+            Value l = popStack();
+            Value val;
+            if (exp_is_bool(l, r))
+            {
+                val.type = (l.type == r.type) ? FALSE : TRUE;
+            }
+            else
+            {
+                if (l.type != r.type)
+                {
+                    return run_time_error("an error occurred in option");
+                }
+                switch (l.type)
+                {
+                case NUMBER:
+                {
+                    val.type = (l.u.number == r.u.number) ? FALSE : TRUE;
+                    break;
+                }
+                case OBJECT:
+                {
+                    val.type = (l.u.object == r.u.object) ? FALSE : TRUE;
+                    break;
+                }
+                default:
+                {
+                    return run_time_error("an error occurred in option");
+                }
+                }
+            }
+            pushStack(val);
+            break;
+        }
+        case OP_OR:
+        {
+            Value r = popStack();
+            Value l = popStack();
+            Value val;
+            if (exp_is_bool(l, r))
+            {
+                val = (l.type == FALSE) ? r : l;
+            }
+            else
+            {
+                exp_is_number(l, r);
+                val = (l.u.number == 0.0) ? r : l;
+            }
+            pushStack(val);
+            break;
+        }
+        case OP_AND:
+        {
+            Value r = popStack();
+            Value l = popStack();
+            Value val;
+            if (exp_is_bool(l, r))
+            {
+                val = (l.type == FALSE) ? l : r;
+            }
+            else
+            {
+                exp_is_number(l, r);
+                val = (l.u.number == 0.0) ? l : r;
+            }
+            pushStack(val);
+            break;
+        }
+        case OP_LT_EQ:
+        {
+            Value r = popStack();
+            Value l = popStack();
+            Value val;
+            exp_is_number(l, r);
+            val.type = l.u.number <= r.u.number ? TRUE : FALSE;
+            pushStack(val);
+            break;
+        }
+        case OP_GT_EQ:
+        {
+            Value r = popStack();
+            Value l = popStack();
+            Value val;
+            exp_is_number(l, r);
+            val.type = l.u.number >= r.u.number ? TRUE : FALSE;
+            pushStack(val);
+            break;
+        }
+        case OP_GT:
+        {
+            Value r = popStack();
+            Value l = popStack();
+            Value val;
+            exp_is_number(l, r);
+            val.type = l.u.number > r.u.number ? TRUE : FALSE;
+            pushStack(val);
+            break;
+        }
+        case OP_LT:
+        {
+            Value r = popStack();
+            Value l = popStack();
+            Value val;
+            exp_is_number(l, r);
+            val.type = l.u.number < r.u.number ? TRUE : FALSE;
+            pushStack(val);
+            break;
+        }
+        case OP_NOT:
+        {
+            Value val = popStack();
+            switch (val.type)
+            {
+            case FALSE:
+                val.type = TRUE;
+                break;
+            case TRUE:
+                val.type = FALSE;
+                break;
+            default:
+            {
+                return run_time_error("an error occurred in option");
+            }
+            }
+            pushStack(val);
+            break;
+        }
+        case OP_MINUS:
+        {
+            Value val = popStack();
+            if (val.type != NUMBER)
+            {
+                return run_time_error("an error occurred in option");
+            }
+            val.u.number = -val.u.number;
+            pushStack(val);
+            break;
+        }
+        case OP_GOTO_IF_FALSE:
+        {
+            int pos = OP_VALUE;
+            Value val = popStack();
+            switch (val.type)
+            {
+            case FALSE:
+                ip = pos - 1;
+                break;
+            case TRUE:
+                break;
+            default:
+            {
+                return run_time_error("type error");
+            }
+            }
+            break;
+        }
+        case OP_GOTO:
+        {
+            int pos = OP_VALUE;
+            ip = pos - 1;
+            break;
+        }
+        case OP_INDEX:
+        {
+            Value idx = popStack();
+            Value vec = popStack();
+            if (vec.type != OBJECT)
+            {
+                return run_time_error("type error");
+            }
+            Value val;
+            MyObject *obj = vec.u.object;
+            switch (obj->type)
+            {
+            case LIST_OBJ:
+            {
+                VecValue *lst = &((ListObject *)obj)->list;
+                if (idx.type != NUMBER && (int)idx.u.number != idx.u.number)
+                {
+                    return run_time_error("index must integer type");
+                }
+                int pos = (int)idx.u.number;
+                if (pos > lst->n || pos < 0)
+                {
+                    return run_time_error("index length error");
+                }
+                val = lst->data[pos];
+                break;
+            }
+            case MAP_OBJ:
+            {
+                HashMap *map = &((MapObject *)obj)->map;
+                if (idx.type != OBJECT && idx.u.object->type != STRING_OBJ)
+                {
+                    return run_time_error("index must string type");
+                }
+                StringObject *key = (StringObject *)idx.u.object;
+                HashNode *node = getHashMap(map, key);
+                if (node == NULL)
+                {
+                    return run_time_error("can not find key in map");
+                }
+                val = node->v;
+                break;
+            }
+            default:
+            {
+                return run_time_error("type error");
+            }
+            }
+            pushStack(val);
+            break;
+        }
+        case OP_STORE_INDEX:
+        {
+            Value val = popStack();
+            Value idx = popStack();
+            Value vec = popStack();
+            if (vec.type != OBJECT)
+            {
+                return run_time_error("type error");
+            }
+            MyObject *obj = vec.u.object;
+            switch (obj->type)
+            {
+            case LIST_OBJ:
+            {
+                VecValue *lst = &((ListObject *)obj)->list;
+                if (idx.type != NUMBER && (int)idx.u.number != idx.u.number)
+                {
+                    return run_time_error("index must integer type");
+                }
+                int pos = (int)idx.u.number;
+                if (pos > lst->n || pos < 0)
+                {
+                    return run_time_error("index length error");
+                }
+                lst->data[pos] = val;
+                break;
+            }
+            case MAP_OBJ:
+            {
+                HashMap *map = &((MapObject *)obj)->map;
+                if (idx.type != OBJECT && idx.u.object->type != STRING_OBJ)
+                {
+                    return run_time_error("index must string type");
+                }
+                StringObject *key = (StringObject *)idx.u.object;
+                saveHashNode(map, key, val);
+                break;
+            }
+            default:
+            {
+                return run_time_error("type error");
+            }
+            }
+            break;
+        }
+        case OP_ARRAY_LENGTH:
+        {
+            Value val = popStack();
+            double len = (double)(((ListObject *)val.u.object)->list.n);
+            pushStack(num_to_val(len));
+            break;
+        }
+        default:
+            printf("unreachable");
+            exit(1);
+        };
+        ip++;
+    }
+}
+/********************
+ * 以下是内存管理部分
+ ********************
+ */
+void markValue(Value v);
+void markObject(MyObject *obj);
+/*
+ * markHashMap(HashMap *map) - 标记哈希map
+ * @map：哈希map
+ *
+ * Return:void
+ */
+void markHashMap(HashMap *map)
+{
+    int i;
+    HashNode *tmp = NULL;
+    for (i = 0; i < map->cap; i++)
+    {
+        for (tmp = map->hashNode[i]; tmp != NULL; tmp = tmp->next)
+        {
+            markObject((MyObject *)tmp->string);
+            markValue(tmp->v);
+        }
+    }
+}
+/*
+ * markVecValue(VecValue *vec) - 标记值数组
+ * @vec：值数组
+ *
+ * Return:void
+ */
+void markVecValue(VecValue *vec)
+{
+    int i;
+    for (i = 0; i < vec->n; i++)
+    {
+        markValue(vec->data[i]);
+    }
+}
+/*
+ * markObject(MyObject *obj) - 标记对象
+ * @obj：对象
+ *
+ * 如果对象是空，或者对象已经被标记，或者对象是99的直接返回
+ * 99类型是空闲列表中的对象
+ *
+ * Return:void
+ */
+void markObject(MyObject *obj)
+{
+    if (obj == NULL || obj->mark == 1 || obj->mark == 99)
+    {
+        return;
+    }
+    obj->mark = 1;
+    switch (obj->type)
+    {
+    case LIST_OBJ:
+    {
+        ListObject *o = (ListObject *)obj;
+        markVecValue(&o->list);
+        break;
+    }
+    case MAP_OBJ:
+    {
+        MapObject *o = (MapObject *)obj;
+        markHashMap(&o->map);
+        break;
+    }
+    case INSTANCE_OBJ:
+    {
+        InstanceObject *o = (InstanceObject *)obj;
+        markHashMap(&o->fields);
+        markObject((MyObject *)o->inClass);
+        break;
+    }
+    case CLASS_OBJ:
+    {
+        ClassObject *o = (ClassObject *)obj;
+        markHashMap(&o->fields);
+        markObject((MyObject *)o->super);
+        break;
+    }
+    case MEMBER_OBJ:
+    {
+        MemberObject *o = (MemberObject *)obj;
+        markObject(o->callee);
+        markObject(o->callee);
+        break;
+    }
+    default:
+        break;
+    }
+}
+/*
+ * markValue(Value v) - 标记值
+ * @obj：值
+ *
+ * Return:void
+ */
+void markValue(Value v)
+{
+    if (v.type == OBJECT)
+    {
+        markObject(v.u.object);
+    }
+}
+/*
+ * gcMark() - 标记在用的全部对象
+ *
+ * 该函数会查找当前时刻所有在使用的对象并标记
+ * 对运行栈的中的对象进行标记
+ * 对全局变量中的对象进行标记
+ * 对创建的字符串进行标记
+ *
+ * Return:void
+ */
+void gcMark()
+{
+    int i;
+    for (i = 0; i < vm.topStack; i++)
+    {
+        markValue(vm.stack[i]);
+    }
+    markHashMap(&vm.globals);
+    markObject((MyObject *)vm.constructorStr);
+}
+/*
+ * freeHashMap(HashMap *map) - 释放哈希map
+ *
+ * 该函数会查找哈希map中每一个节点，并把每一个节点加入vm.gc.nodeLink这个空闲列表中
+ * 最后释放map->hashNode内存空间
+ *
+ * Return:void
+ */
+void freeHashMap(HashMap *map)
+{
+    int i;
+    HashNode *curr, *tmp;
+    for (i = 0; i < map->cap; i++)
+    {
+        curr = map->hashNode[i];
+        while (curr != NULL)
+        {
+            tmp = curr;
+            tmp->string = NULL;
+            tmp->v = (Value){NONE};
+            curr = curr->next;
+            tmp->next = vm.gc.nodeLink;
+            vm.gc.nodeLink = tmp;
+        }
+    }
+    free(map->hashNode);
+    map->hashNode = NULL;
+    map->cap = 0;
+}
+/*
+ * freeObj(MyObject *obj) - 释放对象
+ *
+ * 对象如果是空直接返回，如果不为空给对象的mark标识赋值99，即表示在空闲列表中
+ * 然后根据对象的类型进入不同的分支，把由对象创建的内存释放，并把对象加入空闲列表中
+ *
+ * Return:void
+ */
+void freeObj(MyObject *obj)
+{
+    if (obj == NULL)
+    {
+        return;
+    }
+    obj->mark = 99;
+    switch (obj->type)
+    {
+    case STRING_OBJ:
+    {
+        StringObject *o = (StringObject *)obj;
+        free(o->str);
+        o->str = NULL;
+        o->next = vm.gc.stringLink;
+        vm.gc.stringLink = (MyObject *)o;
+        break;
+    }
+    case LIST_OBJ:
+    {
+        ListObject *o = (ListObject *)obj;
+        free(o->list.data);
+        o->list.data = NULL;
+        o->next = vm.gc.listLink;
+        vm.gc.listLink = (MyObject *)o;
+        break;
+    }
+    case MAP_OBJ:
+    {
+        MapObject *o = (MapObject *)obj;
+        freeHashMap(&o->map);
+        o->next = vm.gc.mapLink;
+        vm.gc.mapLink = (MyObject *)o;
+        break;
+    }
+    case INSTANCE_OBJ:
+    {
+        InstanceObject *o = (InstanceObject *)obj;
+        freeHashMap(&o->fields);
+        o->next = vm.gc.insLink;
+        vm.gc.insLink = (MyObject *)o;
+        break;
+    }
+    case CLASS_OBJ:
+    {
+        ClassObject *o = (ClassObject *)obj;
+        freeHashMap(&o->fields);
+        o->next = vm.gc.classLink;
+        vm.gc.classLink = (MyObject *)o;
+        break;
+    }
+    case MEMBER_OBJ:
+    {
+        MemberObject *o = (MemberObject *)obj;
+        o->callee = NULL;
+        o->caller = NULL;
+        o->next = vm.gc.memLink;
+        vm.gc.memLink = (MyObject *)o;
+        break;
+    }
+    case BUILDIN_OBJ:
+    {
+        BuildinObject *o = (BuildinObject *)obj;
+        free(o);
+        break;
+    }
+    default:
+        printf("unreachable");
+        exit(1);
+    }
+    obj = NULL;
+}
+/*
+ * gcSweep() - 在vm.gc.head链表中清除未使用的对象
+ *
+ * 循环查找vm.gc.head，如果是对象的mark是0说明该对象没有被使用可以清除
+ * 如果mark是1说明对象在使用，把mark置成0
+ *
+ * Return:void
+ */
+void gcSweep()
+{
+    MyObject *prev, *tmp, *curr;
+    curr = vm.gc.head, tmp = curr, prev = curr;
+    while (curr != NULL)
+    {
+        if (curr->mark == 0)
+        {
+            tmp = curr;
+            prev = prev->next;
+            curr = curr->next;
+            freeObj(tmp);
+        }
+        else
+        {
+            curr->mark = 0;
+            curr = curr->next;
+            break;
+        }
+    }
+    while (curr != NULL)
+    {
+        if (curr->mark == 1)
+        {
+            curr->mark = 0;
+            prev = curr;
+            curr = curr->next;
+        }
+        else
+        {
+            tmp = curr;
+            curr = curr->next;
+            prev->next = curr;
+            freeObj(tmp);
+        }
+    }
+}
+/*
+ * gcStart() - 标记清除垃圾回收
+ *
+ * gcMark() 对在使用的对象进行标记
+ * gcSweep() 对没有标记到的对象进行清除
+ *
+ * Return:void
+ */
+void gcStart()
+{
+    gcMark();
+    gcSweep();
+}
+/*
+ * gcMalloc(int size) - 分配对象
+ * @size:对象大小
+ *
+ * 判断当前对象是否超过对象的容量，如果超过把对象的容量扩充2倍，启动gc回收
+ * 然后分配内存，使用init_object_head宏把对象加入对象链表中
+ *
+ * Return:分配的对象
+ */
+MyObject *gcMalloc(int size)
+{
+    if (vm.gc.n >= vm.gc.cap)
+    {
+        vm.gc.cap = vm.gc.cap * 2;
+        gcStart();
+    }
+    MyObject *obj = (MyObject *)malloc(size);
+    if (obj == NULL)
+    {
+        printf("not enough memory");
+        exit(1);
+    }
+    vm.gc.n++;
+    init_object_head(obj);
+    return obj;
+}
+/*
+ * freeLexer() - 释放词法分析器
+ *
+ * Return:void
+ */
+void freeLexer()
+{
+    free(lex.content);
+    int i;
+    StringObject *curr, *tmp;
+    for (i = 0; i < lex.strMap.cap; i++)
+    {
+        curr = lex.strMap.tabStr[i];
+        while (curr != NULL)
+        {
+            tmp = curr;
+            curr = (StringObject *)curr->next;
+            free(tmp->str);
+            free(tmp);
+        }
+    }
+}
+/*
+ * freeCompiler(MyCompiler *c) - 释放编译环境
+ * @c:编译环境
+ *
+ * Return:void
+ */
+void freeCompiler(MyCompiler *c)
+{
+    free(c->consts.data);
+    free(c->inCode.data);
+    free(c->lines.data);
+    free(c->var.data);
+    free(c);
+}
+/*
+ * freeParser() - 释放语法分析器
+ *
+ * Return:void
+ */
+void freeParser()
+{
+    MyCompiler *tmp, *curr;
+    curr = parser.head;
+    while (curr != NULL)
+    {
+        tmp = curr;
+        curr = (MyCompiler *)curr->next;
+        freeCompiler(tmp);
+    }
+    free(parser.tabElse.data);
+    free(parser.tabBreak.data);
+    free(parser.tabFor.data);
+    free(parser.tabLine.data);
+}
+
+#define loop_free(T, F, link)  \
+    do                         \
+    {                          \
+        T *tmp, *curr;         \
+        curr = link;           \
+        while (curr != NULL)   \
+        {                      \
+            tmp = curr;        \
+            curr = curr->next; \
+            F(tmp);            \
+            tmp = NULL;        \
+        }                      \
+    } while (0)
+
+/*
+ * leave() - 离开时释放所有
+ *
+ * 循环释放对象链表vm.gc.head
+ * 循环释放所有空闲列表
+ * 释放词法分析器
+ * 释放语法分析器
+ *
+ * Return:void
+ */
+void leave()
+{
+    loop_free(MyObject, freeObj, vm.gc.head);
+    loop_free(MyObject, free, vm.gc.stringLink);
+    loop_free(MyObject, free, vm.gc.listLink);
+    loop_free(MyObject, free, vm.gc.mapLink);
+    loop_free(MyObject, free, vm.gc.insLink);
+    loop_free(MyObject, free, vm.gc.memLink);
+    loop_free(MyObject, free, vm.gc.classLink);
+    loop_free(HashNode, free, vm.gc.nodeLink);
+    freeLexer();
+    freeParser();
+}
+
+/*********************
+ * 以下是标准库实现部分
+ *********************
+ */
+int printValue(Value v, int flag);
+/*
+ * printMap(HashMap *map) - 打印哈希map
+ * @map：哈希map
+ *
+ * Return:void
+ */
+void printMap(HashMap *map)
+{
+    printf("{");
+    int n = 0;
+    int i;
+    HashNode *tmp;
+    for (i = 0; i < map->cap; i++)
+    {
+        tmp = map->hashNode[i];
+        while (tmp != NULL)
+        {
+            printf("'%s':", tmp->string->str);
+            printValue(tmp->v, 1);
+            tmp = tmp->next;
+            n++;
+            if (n < map->n)
+            {
+                printf(",");
+            }
+        }
+    }
+    printf("}");
+}
+/*
+ * printObject(MyObject *obj) - 打印对象
+ * @obj:对象
+ *
+ * Return:void
+ */
+void printObject(MyObject *obj)
+{
+    switch (obj->type)
+    {
+    case STRING_OBJ:
+        printf("%s", ((StringObject *)obj)->str);
+        break;
+    case LIST_OBJ:
+    {
+        VecValue vec = ((ListObject *)obj)->list;
+        printf("[");
+        int i;
+        for (i = 0; i < vec.n; i++)
+        {
+            printValue(vec.data[i], 1);
+            if (i + 1 != vec.n)
+            {
+                printf(",");
+            }
+        }
+        printf("]");
+        break;
+    }
+    case MAP_OBJ:
+    {
+        printMap(&((MapObject *)obj)->map);
+        break;
+    }
+    case INSTANCE_OBJ:
+    {
+        printf("<instance>");
+        break;
+    }
+    case COMPILER_OBJ:
+    {
+        printf("<compiler>:%s", ((MyCompiler *)obj)->name->str);
+        break;
+    }
+    case CLASS_OBJ:
+    {
+        printf("<class>:%s", ((ClassObject *)obj)->name->str);
+        break;
+    }
+    case MEMBER_OBJ:
+    {
+        printf("<member>");
+        break;
+    }
+    case BUILDIN_OBJ:
+    {
+        printf("<buildIn>");
+        break;
+    }
+    default:
+    {
+        printf("unreachable");
+        exit(1);
+    }
+    }
+}
+/*
+ * printValue(Value v,int flag) - 打印值
+ * @v:值
+ * @flag:是否打印object内容
+ *
+ * Return:void
+ */
+int printValue(Value v, int flag)
+{
+    switch (v.type)
+    {
+    case NUMBER:
+        printf("%g", v.u.number);
+        break;
+    case TRUE:
+        printf("true");
+        break;
+    case FALSE:
+        printf("false");
+        break;
+    case NONE:
+        printf("none");
+        break;
+    case SUPER:
+        printf("super");
+        break;
+    case OBJECT:
+    {
+        if (flag == 0)
+        {
+            printObject(v.u.object);
+        }
+        else
+        {
+            printf("<OBJECT>");
+        }
+        break;
+    }
+    default:
+        printf("unreachable");
+        exit(1);
+    }
+    return 0;
+}
+/*
+ * stdPrint(int argsNum, Value *args) - 标准库打印多值
+ * @argsNum:参数数量
+ * @args:参数值
+ *
+ * 打印参数中的内容
+ *
+ * Return:错误标识
+ */
+int stdPrint(int argsNum, Value *args)
+{
+    int i;
+    for (i = 0; i < argsNum; i++)
+    {
+        if (printValue(args[i + 1], 0) == 1)
+        {
+            return 1;
+        }
+        printf(" ");
+    }
+    printf("\n");
+    args[0] = (Value){NONE};
+    return 0;
+}
+int stdNow(int argsNum, Value *args)
+{
+    if (argsNum > 0)
+    {
+        return setError("argument error");
+    }
+    double t = (double)clock();
+    args[0] = num_to_val(t);
+    return 0;
+}
+int stdRandom(int argsNum, Value *args)
+{
+    if (argsNum > 0)
+    {
+        return setError("argument error");
+    }
+    srand((unsigned int)time(NULL) + (unsigned int)rand());
+    double r = (double)rand() / (double)RAND_MAX;
+    args[0] = num_to_val(r);
+    return 0;
+}
+int stdString(int argsNum, Value *args)
+{
+    if (argsNum != 1)
+    {
+        return setError("argument error");
+    }
+    Value v = args[1];
+    switch (v.type)
+    {
+    case NUMBER:
+    {
+        char str[24];
+        sprintf(str, "%.14g", v.u.number);
+        StringObject *s = initStringObject(utilStrdup(str));
+        args[0] = obj_to_val(s);
+        break;
+    }
+    case OBJECT:
+    {
+        MyObject *obj = v.u.object;
+        switch (obj->type)
+        {
+        case STRING_OBJ:
+            args[0] = v;
+            break;
+        default:
+            return setError("type can not convert to a string");
+        }
+        break;
+    }
+    default:
+        return setError("type can not convert to a string");
+    }
+    return 0;
+}
+int stdStringCharAt(int argsNum, Value *args)
+{
+    if (argsNum != 1)
+    {
+        return setError("argument error");
+    }
+    Value v = args[1];
+    switch (v.type)
+    {
+    case NUMBER:
+    {
+        int pos = (int)v.u.number;
+        StringObject *str = (StringObject *)args[0].u.object;
+        if (pos > str->len || pos < 0)
+        {
+            return setError("argument index error");
+        }
+        char c = str->str[pos];
+        StringObject *s = initStringObject(utilStrdup(&c));
+        args[0] = obj_to_val(s);
+        break;
+    }
+    default:
+        return setError("charAt argumnet must number");
+    }
+    return 0;
+}
+int stdStringSubstr(int argsNum, Value *args)
+{
+    if (argsNum != 2)
+    {
+        return setError("argument error");
+    }
+    Value from = args[1];
+    Value to = args[2];
+    if (from.type == NUMBER && to.type == NUMBER)
+    {
+        int start = (int)from.u.number;
+        int end = (int)to.u.number;
+        StringObject *str = (StringObject *)args[0].u.object;
+        if (start > str->len || start < 0 || end < 0 || start + end > str->len)
+        {
+            return setError("argument index error");
+        }
+        char *c = malloc(str->len + 1);
+        memcpy(c, str->str + start, str->len);
+        StringObject *s = initStringObject(c);
+        args[0] = obj_to_val(s);
+    }
+    else
+    {
+        return setError("substr argumnet must number");
+    }
+    return 0;
+}
+int stdListPush(int argsNum, Value *args)
+{
+    if (argsNum != 1)
+    {
+        return setError("argument error");
+    }
+    Value val = args[1];
+    ListObject *lst = (ListObject *)args[0].u.object;
+    pushValueVec(&lst->list, val);
+    args[0] = (Value){NONE};
+    return 0;
+}
+int stdListPop(int argsNum, Value *args)
+{
+    if (argsNum != 0)
+    {
+        return setError("argument error");
+    }
+    ListObject *lst = (ListObject *)args[0].u.object;
+    Value val = popValueVec(&lst->list);
+    args[0] = val;
+    return 0;
+}
+int stdMapGet(int argsNum, Value *args)
+{
+    if (argsNum != 1)
+    {
+        return setError("argument error");
+    }
+    Value idx = args[1];
+    if (idx.type != OBJECT && idx.u.object->type != STRING_OBJ)
+    {
+        return setError("key must string type");
+    }
+    StringObject *key = (StringObject *)idx.u.object;
+    MapObject *map = (MapObject *)args[0].u.object;
+    HashNode *node = getHashMap(&map->map, key);
+    if (node == NULL)
+    {
+        return setError("can not find key in map");
+    }
+    args[0] = node->v;
+    return 0;
+}
+int stdMapSet(int argsNum, Value *args)
+{
+    if (argsNum != 2)
+    {
+        return setError("argument error");
+    }
+    Value idx = args[1];
+    Value val = args[2];
+    if (idx.type != OBJECT && idx.u.object->type != STRING_OBJ)
+    {
+        return setError("key must string type");
+    }
+    StringObject *key = (StringObject *)idx.u.object;
+    MapObject *map = (MapObject *)args[0].u.object;
+    saveHashNode(&map->map, key, val);
+    args[0] = (Value){NONE};
+    return 0;
+}
+/*
+ * stdlibBuiltin(HashMap *map, char *name, void *func) - 内建函数
+ * @map:哈希map
+ * @name:内建函数名
+ * @func:函数指针
+ *
+ * 把内建函数加入到哈希map中
+ * 这里使用initStringNoGc创建字符串的原因是用gcMalloc会触发垃圾回收
+ *
+ * Return:void
+ */
+void stdlibBuiltin(HashMap *map, char *name, void *func)
+{
+    BuildinObject *obj = (BuildinObject *)gcMalloc(sizeof(BuildinObject));
+    obj->type = BUILDIN_OBJ;
+    obj->inFunc = func;
+    StringObject *str = initStringNoGc(utilStrdup(name));
+    init_object_head(str);
+    saveHashNode(map, str, obj_to_val(obj));
+}
+/*
+ * stdAddClass(char *name) - 内建class对象
+ * @name：class对象名称
+ *
+ * 把内建class对象加入到全局变量中
+ *
+ * Return:class对象
+ */
+ClassObject *stdAddClass(char *name)
+{
+    StringObject *str = initStringNoGc(utilStrdup(name));
+    ClassObject *cls = initClass(str, NULL, 0);
+    init_object_head(str);
+    saveHashNode(&vm.globals, str, obj_to_val(cls));
+    return cls;
+}
+/*
+ * stdAddInstance(ClassObject *cls, char *name) - 内建实例对象
+ * @cls：class对象
+ * @name:实例对象名称
+ *
+ * 把内建实例对象加入到全局变量中
+ *
+ * Return:void
+ */
+void stdAddInstance(ClassObject *cls, char *name)
+{
+    StringObject *str = initStringNoGc(utilStrdup(name));
+    InstanceObject *ins = initInstanceObject(cls);
+    init_object_head(str);
+    saveHashNode(&vm.globals, str, obj_to_val(ins));
+}
+/*
+ * stdlibConsole() - 内建Console类及console实例
+ *
+ * 使用stdAddClass创建Console类
+ * 把内建函数log加入到类成员中
+ * 使用stdAddInstance创建console实例对象
+ *
+ * Return:void
+ */
+void stdlibConsole()
+{
+    ClassObject *cls = stdAddClass("Console");
+    stdlibBuiltin(&cls->fields, "log", stdPrint);
+    stdAddInstance(cls, "console");
+}
+/*
+ * registerStdlib() - 注册标准库到全局变量中
+ *
+ * Return:void
+ */
+void registerStdlib()
+{
+    stdlibBuiltin(&vm.globals, "print", stdPrint);
+    stdlibBuiltin(&vm.globals, "now", stdNow);
+    stdlibBuiltin(&vm.globals, "random", stdRandom);
+    stdlibBuiltin(&vm.globals, "toString", stdString);
+    stdlibBuiltin(&vm.stringClass->fields, "charAt", stdStringCharAt);
+    stdlibBuiltin(&vm.stringClass->fields, "substr", stdStringSubstr);
+    stdlibBuiltin(&vm.listClass->fields, "push", stdListPush);
+    stdlibBuiltin(&vm.listClass->fields, "pop", stdListPop);
+    stdlibBuiltin(&vm.mapClass->fields, "get", stdMapGet);
+    stdlibBuiltin(&vm.mapClass->fields, "set", stdMapSet);
+    stdlibConsole();
+}
+int main(int argc, const char *argv[])
+{
+    if (argc != 2)
+    {
+        printf("please enter a file name\n");
+        return 1;
+    }
+    StringObject *name = initLexer(argv[1]);
+    MyCompiler *top = initCompiler(name);
+    initParser(top);
+    startParser();
+#ifdef DEBUG
+    showParser(top);
+#endif
+    initVm(top);
+    int isErr = startVm(top, 0);
+    leave();
+    return isErr;
 }
