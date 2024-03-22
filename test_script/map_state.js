@@ -1,0 +1,10 @@
+map = { "a": 1, "b": 2 };
+console.log(map);
+a = map.get("a");
+console.log(a);
+b = map.b;
+console.log(b);
+map.set("c", 3);
+c = map["c"];
+console.log(c);
+console.log(map);
